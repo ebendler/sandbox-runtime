@@ -102,6 +102,36 @@ function findSymlinkInPath(
 }
 
 /**
+ * Check if any existing component in the path is a file (not a directory).
+ * If so, the target path can never be created because you can't mkdir under a file.
+ *
+ * This handles the git worktree case: .git is a file, so .git/hooks can never
+ * exist and there's nothing to deny.
+ */
+function hasFileAncestor(targetPath: string): boolean {
+  const parts = targetPath.split(path.sep)
+  let currentPath = ''
+
+  for (const part of parts) {
+    if (!part) continue // Skip empty parts (leading /)
+    const nextPath = currentPath + path.sep + part
+    try {
+      const stat = fs.statSync(nextPath)
+      if (stat.isFile() || stat.isSymbolicLink()) {
+        // This component exists as a file — nothing below it can be created
+        return true
+      }
+    } catch {
+      // Path doesn't exist — stop checking
+      break
+    }
+    currentPath = nextPath
+  }
+
+  return false
+}
+
+/**
  * Find the first non-existent path component.
  * E.g., for "/existing/parent/nonexistent/child/file.txt" where /existing/parent exists,
  * returns "/existing/parent/nonexistent"
@@ -148,13 +178,29 @@ async function linuxGetMandatoryDenyPaths(
     ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
     // Dangerous directories in CWD
     ...dangerousDirectories.map(d => path.resolve(cwd, d)),
-    // Git hooks always blocked for security
-    path.resolve(cwd, '.git/hooks'),
   ]
 
-  // Git config conditionally blocked based on allowGitConfig setting
-  if (!allowGitConfig) {
-    denyPaths.push(path.resolve(cwd, '.git/config'))
+  // Git hooks and config are only denied when .git exists as a directory.
+  // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
+  // .git/hooks can never exist — denying it would cause bwrap to fail.
+  // When .git doesn't exist at all, mounting at .git would block its
+  // creation and break git init.
+  const dotGitPath = path.resolve(cwd, '.git')
+  let dotGitIsDirectory = false
+  try {
+    dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
+  } catch {
+    // .git doesn't exist
+  }
+
+  if (dotGitIsDirectory) {
+    // Git hooks always blocked for security
+    denyPaths.push(path.resolve(cwd, '.git/hooks'))
+
+    // Git config conditionally blocked based on allowGitConfig setting
+    if (!allowGitConfig) {
+      denyPaths.push(path.resolve(cwd, '.git/config'))
+    }
   }
 
   // Build iglob args for all patterns in one ripgrep call
@@ -284,15 +330,25 @@ function registerExitCleanupHandler(): void {
 export function cleanupBwrapMountPoints(): void {
   for (const mountPoint of bwrapMountPoints) {
     try {
-      // Only remove if it's still the empty file bwrap created.
+      // Only remove if it's still the empty file/directory bwrap created.
       // If something else has written real content, leave it alone.
       if (fs.existsSync(mountPoint)) {
         const stat = fs.statSync(mountPoint)
         if (stat.isFile() && stat.size === 0) {
           fs.unlinkSync(mountPoint)
           logForDebugging(
-            `[Sandbox Linux] Cleaned up bwrap mount point: ${mountPoint}`,
+            `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
           )
+        } else if (stat.isDirectory()) {
+          // Empty directory mount points are created for intermediate
+          // components (Fix 2). Only remove if still empty.
+          const entries = fs.readdirSync(mountPoint)
+          if (entries.length === 0) {
+            fs.rmdirSync(mountPoint)
+            logForDebugging(
+              `[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`,
+            )
+          }
         }
       }
     } catch {
@@ -662,6 +718,17 @@ async function generateFilesystemArgs(
       // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
       // remove them after the command exits.
       if (!fs.existsSync(normalizedPath)) {
+        // Fix 1 (worktree): If any existing component in the deny path is a
+        // file (not a directory), skip the deny entirely. You can't mkdir
+        // under a file, so the deny path can never be created. This handles
+        // git worktrees where .git is a file.
+        if (hasFileAncestor(normalizedPath)) {
+          logForDebugging(
+            `[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`,
+          )
+          continue
+        }
+
         // Find the deepest existing ancestor directory
         let ancestorPath = path.dirname(normalizedPath)
         while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
@@ -679,12 +746,29 @@ async function generateFilesystemArgs(
 
         if (ancestorIsWithinAllowedPath) {
           const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
-          args.push('--ro-bind', '/dev/null', firstNonExistent)
-          bwrapMountPoints.add(firstNonExistent)
-          registerExitCleanupHandler()
-          logForDebugging(
-            `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
-          )
+
+          // Fix 2: If firstNonExistent is an intermediate component (not the
+          // leaf deny path itself), mount a read-only empty directory instead
+          // of /dev/null. This prevents the component from appearing as a file
+          // which breaks tools that expect to traverse it as a directory.
+          if (firstNonExistent !== normalizedPath) {
+            const emptyDir = fs.mkdtempSync(
+              path.join(tmpdir(), 'claude-empty-'),
+            )
+            args.push('--ro-bind', emptyDir, firstNonExistent)
+            bwrapMountPoints.add(firstNonExistent)
+            registerExitCleanupHandler()
+            logForDebugging(
+              `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
+            )
+          } else {
+            args.push('--ro-bind', '/dev/null', firstNonExistent)
+            bwrapMountPoints.add(firstNonExistent)
+            registerExitCleanupHandler()
+            logForDebugging(
+              `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
+            )
+          }
         } else {
           logForDebugging(
             `[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`,
