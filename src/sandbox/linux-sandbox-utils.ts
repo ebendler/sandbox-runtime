@@ -332,23 +332,21 @@ export function cleanupBwrapMountPoints(): void {
     try {
       // Only remove if it's still the empty file/directory bwrap created.
       // If something else has written real content, leave it alone.
-      if (fs.existsSync(mountPoint)) {
-        const stat = fs.statSync(mountPoint)
-        if (stat.isFile() && stat.size === 0) {
-          fs.unlinkSync(mountPoint)
+      const stat = fs.statSync(mountPoint)
+      if (stat.isFile() && stat.size === 0) {
+        fs.unlinkSync(mountPoint)
+        logForDebugging(
+          `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
+        )
+      } else if (stat.isDirectory()) {
+        // Empty directory mount points are created for intermediate
+        // components (Fix 2). Only remove if still empty.
+        const entries = fs.readdirSync(mountPoint)
+        if (entries.length === 0) {
+          fs.rmdirSync(mountPoint)
           logForDebugging(
-            `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
+            `[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`,
           )
-        } else if (stat.isDirectory()) {
-          // Empty directory mount points are created for intermediate
-          // components (Fix 2). Only remove if still empty.
-          const entries = fs.readdirSync(mountPoint)
-          if (entries.length === 0) {
-            fs.rmdirSync(mountPoint)
-            logForDebugging(
-              `[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`,
-            )
-          }
         }
       }
     } catch {
