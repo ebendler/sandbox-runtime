@@ -29,7 +29,7 @@
   "dependencies": {
     "@pondwader/socks5-server": "^1.0.10",
     "@types/lodash-es": "^4.17.12",
-    "commander": "^14.0.3",
+    "commander": "^13.1.0",
     "lodash-es": "^4.17.23",
     "shell-quote": "^1.8.3",
     "zod": "^3.25.76"
@@ -47,10 +47,10 @@
     "eslint-plugin-prettier": "^5.5.5",
     "globals": "^17.3.0",
     "husky": "^9.1.7",
-    "lint-staged": "^16.2.7",
+    "lint-staged": "^15.5.2",
     "prettier": "^3.8.1",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.56.0"
+    "typescript-eslint": "8.55.0"
   },
   "files": [
     "dist",
