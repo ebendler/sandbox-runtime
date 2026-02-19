@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   existsSync,
   unlinkSync,
@@ -14,6 +14,91 @@ import { getPlatform } from '../../src/utils/platform.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { generateSeccompFilter } from '../../src/sandbox/generate-seccomp-filter.js'
+
+// ============================================================================
+// Async exec helper – keeps the event loop alive so the in-process HTTP / SOCKS
+// proxy can service requests while the sandboxed command is running.
+// ============================================================================
+
+interface ExecResult {
+  status: number | null
+  stdout: string
+  stderr: string
+}
+
+function execCommand(
+  command: string,
+  options: {
+    shell?: boolean | string
+    encoding?: string
+    timeout?: number
+    cwd?: string
+    env?: NodeJS.ProcessEnv
+  } = {},
+): Promise<ExecResult> {
+  return new Promise<ExecResult>(resolve => {
+    const timeout = options.timeout ?? 10000
+    const child = spawn('sh', ['-c', command], {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString()
+    })
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString()
+    })
+
+    const finish = (status: number | null) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve({ status, stdout, stderr })
+    }
+
+    child.on('close', code => finish(code))
+    child.on('error', () => finish(null))
+
+    if (timeout > 0) {
+      timer = setTimeout(() => {
+        if (!settled) {
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            // ignore
+          }
+          finish(null)
+        }
+      }, timeout)
+    }
+  })
+}
+
+/**
+ * Async wrapper around the `timeout` command – runs `timeout <secs> bash -c <cmd>`
+ * while keeping the event loop alive.
+ */
+function execWithTimeout(
+  seconds: number,
+  command: string,
+  options: { cwd?: string; timeout?: number } = {},
+): Promise<ExecResult> {
+  // shell-escape the inner command for bash -c
+  const escaped = command.replace(/'/g, "'\\''")
+  const outer = `timeout ${seconds} bash -c '${escaped}'`
+  return execCommand(outer, {
+    shell: true,
+    timeout: options.timeout ?? (seconds + 5) * 1000,
+    cwd: options.cwd,
+  })
+}
 
 /**
  * Create a minimal test configuration for the sandbox with example.com allowed
@@ -151,9 +236,8 @@ describe('Sandbox Integration Tests', () => {
           `echo "Test message" | nc -U ${TEST_SOCKET_PATH}`,
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -178,9 +262,8 @@ describe('Sandbox Integration Tests', () => {
           'curl -s http://blocked-domain.example',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -198,10 +281,9 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 https://www.anthropic.com',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
+          timeout: 5000,
         })
 
         // The proxy blocks the connection, causing curl to timeout or fail
@@ -226,9 +308,8 @@ describe('Sandbox Integration Tests', () => {
           'curl -s http://example.com',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 10000,
         })
 
@@ -256,9 +337,8 @@ describe('Sandbox Integration Tests', () => {
           `echo "should fail" > ${testFile}`,
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           cwd: TEST_DIR,
           timeout: 5000,
         })
@@ -291,9 +371,8 @@ describe('Sandbox Integration Tests', () => {
           `echo "${testContent}" > allowed-write.txt`,
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           cwd: TEST_DIR,
           timeout: 5000,
         })
@@ -332,9 +411,8 @@ describe('Sandbox Integration Tests', () => {
           'head -n 5 ~/.bashrc',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -353,9 +431,8 @@ describe('Sandbox Integration Tests', () => {
         }
 
         // Import wrapCommandWithSandboxLinux to call directly
-        const { wrapCommandWithSandboxLinux } = await import(
-          '../../src/sandbox/linux-sandbox-utils.js'
-        )
+        const { wrapCommandWithSandboxLinux } =
+          await import('../../src/sandbox/linux-sandbox-utils.js')
 
         const testFile = join(TEST_DIR, 'seccomp-only-write.txt')
         const testContent = 'seccomp-only test content'
@@ -372,9 +449,8 @@ describe('Sandbox Integration Tests', () => {
           allowAllUnixSockets: false, // Enable seccomp
         })
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           cwd: TEST_DIR,
           timeout: 5000,
         })
@@ -412,9 +488,8 @@ describe('Sandbox Integration Tests', () => {
           'echo "Hello from sandbox"',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -431,9 +506,8 @@ describe('Sandbox Integration Tests', () => {
           'echo "line1\nline2\nline3" | grep line2',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -465,9 +539,8 @@ describe('Sandbox Integration Tests', () => {
           'zsh',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -497,9 +570,8 @@ describe('Sandbox Integration Tests', () => {
           'zsh',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -517,9 +589,8 @@ describe('Sandbox Integration Tests', () => {
           'echo "Shell: $BASH_VERSION"',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -541,9 +612,8 @@ describe('Sandbox Integration Tests', () => {
           'ls /proc | grep -E "^[0-9]+$" | wc -l',
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -570,9 +640,8 @@ describe('Sandbox Integration Tests', () => {
           `ln -s ${targetOutside} ${linkInAllowed} 2>&1 && echo "escaped" > ${linkInAllowed} 2>&1`,
         )
 
-        const result = spawnSync(command, {
+        const result = await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           cwd: TEST_DIR,
           timeout: 5000,
         })
@@ -611,9 +680,8 @@ describe('Sandbox Integration Tests', () => {
         )
 
         const startTime = Date.now()
-        spawnSync(command, {
+        await execCommand(command, {
           shell: true,
-          encoding: 'utf8',
           cwd: TEST_DIR,
           timeout: 5000,
         })
@@ -661,8 +729,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Use timeout to kill the sandbox after 1 second
         // The inner command would take 10 seconds to complete
-        const result = spawnSync('timeout', ['1', 'bash', '-c', command], {
-          encoding: 'utf8',
+        const result = await execWithTimeout(1, command, {
           cwd: TEST_DIR,
           timeout: 5000,
         })
@@ -707,8 +774,7 @@ describe('Sandbox Integration Tests', () => {
         )
 
         // Kill after 0.5 seconds
-        spawnSync('timeout', ['0.5', 'bash', '-c', command], {
-          encoding: 'utf8',
+        await execWithTimeout(0.5, command, {
           cwd: TEST_DIR,
           timeout: 3000,
         })
@@ -717,13 +783,9 @@ describe('Sandbox Integration Tests', () => {
         await new Promise(resolve => setTimeout(resolve, 1500))
 
         // Check for orphan processes with our marker
-        const psResult = spawnSync(
-          'bash',
-          ['-c', `ps aux | grep "${uniqueMarker}" | grep -v grep || true`],
-          {
-            encoding: 'utf8',
-            timeout: 2000,
-          },
+        const psResult = await execCommand(
+          `ps aux | grep "${uniqueMarker}" | grep -v grep || true`,
+          { timeout: 2000 },
         )
 
         // Should not find any orphan processes
@@ -749,9 +811,8 @@ describe('Sandbox Integration Tests', () => {
           `cp /bin/bash ${setuidTest} 2>&1 && chmod u+s ${setuidTest} 2>&1 && ${setuidTest} -c "id -u" 2>&1`,
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await execCommand(command1, {
           shell: true,
-          encoding: 'utf8',
           cwd: TEST_DIR,
           timeout: 5000,
         })
@@ -765,9 +826,8 @@ describe('Sandbox Integration Tests', () => {
           'sudo -n echo "elevated" 2>&1 || su -c "echo elevated" 2>&1 || echo "commands blocked"',
         )
 
-        const result2 = spawnSync(command2, {
+        const result2 = await execCommand(command2, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -799,10 +859,9 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 --connect-timeout 2 https://blocked-domain.example 2>&1 || echo "curl_failed"',
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await execCommand(command1, {
           shell: true,
-          encoding: 'utf8',
-          timeout: 4000,
+          timeout: 5000,
         })
 
         // Should fail - curl should not succeed
@@ -821,10 +880,9 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 http://blocked-domain.example:8080 2>&1',
         )
 
-        const result2 = spawnSync(command2, {
+        const result2 = await execCommand(command2, {
           shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
+          timeout: 5000,
         })
 
         // Should be blocked - check output contains block message
@@ -837,10 +895,9 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --max-time 2 http://1.1.1.1 2>&1', // Cloudflare DNS
         )
 
-        const result3 = spawnSync(command3, {
+        const result3 = await execCommand(command3, {
           shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
+          timeout: 5000,
         })
 
         // IP addresses should be blocked by the proxy
@@ -853,9 +910,8 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --max-time 5 https://example.com 2>&1',
         )
 
-        const result4 = spawnSync(command4, {
+        const result4 = await execCommand(command4, {
           shell: true,
-          encoding: 'utf8',
           timeout: 10000,
         })
 
@@ -892,9 +948,8 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --max-time 3 http://api.github.com 2>&1 | head -20',
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await execCommand(command1, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -907,10 +962,9 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --max-time 2 http://github.com 2>&1',
         )
 
-        const result2 = spawnSync(command2, {
+        const result2 = await execCommand(command2, {
           shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
+          timeout: 5000,
         })
 
         // Should be blocked - github.com does NOT match *.github.com
@@ -922,10 +976,9 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --max-time 2 http://malicious-github.com 2>&1',
         )
 
-        const result3 = spawnSync(command3, {
+        const result3 = await execCommand(command3, {
           shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
+          timeout: 5000,
         })
 
         // Should be blocked - malicious-github.com does NOT match *.github.com
@@ -937,9 +990,8 @@ describe('Sandbox Integration Tests', () => {
           'curl -s --max-time 3 http://raw.githubusercontent.com 2>&1 | head -20',
         )
 
-        const result4 = spawnSync(command4, {
+        const result4 = await execCommand(command4, {
           shell: true,
-          encoding: 'utf8',
           timeout: 5000,
         })
 
@@ -974,9 +1026,8 @@ describe('Sandbox Integration Tests', () => {
           `mkfifo ${fifoPath} && test -p ${fifoPath} && echo "FIFO created"`,
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await execCommand(command1, {
           shell: true,
-          encoding: 'utf8',
           timeout: 3000,
         })
 
@@ -990,9 +1041,8 @@ describe('Sandbox Integration Tests', () => {
           `echo "test content" > ${regularFile}`,
         )
 
-        spawnSync(command2a, {
+        await execCommand(command2a, {
           shell: true,
-          encoding: 'utf8',
           timeout: 3000,
         })
 
@@ -1001,9 +1051,8 @@ describe('Sandbox Integration Tests', () => {
           `ln /etc/passwd ${hardlinkPath} 2>&1`,
         )
 
-        const result2b = spawnSync(command2b, {
+        const result2b = await execCommand(command2b, {
           shell: true,
-          encoding: 'utf8',
           timeout: 3000,
         })
 
@@ -1020,9 +1069,8 @@ describe('Sandbox Integration Tests', () => {
           `mknod ${devicePath} c 1 3 2>&1`,
         )
 
-        const result3 = spawnSync(command3, {
+        const result3 = await execCommand(command3, {
           shell: true,
-          encoding: 'utf8',
           timeout: 3000,
         })
 
@@ -1113,9 +1161,8 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
         'curl -s --max-time 2 --connect-timeout 2 http://example.com 2>&1 || echo "network_failed"',
       )
 
-      const result = spawnSync(command, {
+      const result = await execCommand(command, {
         shell: true,
-        encoding: 'utf8',
         timeout: 5000,
       })
 
@@ -1151,9 +1198,8 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
         'curl -s --max-time 2 --connect-timeout 2 https://example.com 2>&1 || echo "network_failed"',
       )
 
-      const result = spawnSync(command, {
+      const result = await execCommand(command, {
         shell: true,
-        encoding: 'utf8',
         timeout: 5000,
       })
 
@@ -1183,9 +1229,8 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
         'host example.com 2>&1 || nslookup example.com 2>&1 || echo "dns_failed"',
       )
 
-      const result = spawnSync(command, {
+      const result = await execCommand(command, {
         shell: true,
-        encoding: 'utf8',
         timeout: 5000,
       })
 
@@ -1213,9 +1258,8 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
         'wget -q --timeout=2 -O - http://example.com 2>&1 || echo "wget_failed"',
       )
 
-      const result = spawnSync(command, {
+      const result = await execCommand(command, {
         shell: true,
-        encoding: 'utf8',
         timeout: 5000,
       })
 
@@ -1245,9 +1289,8 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
         `echo "${testContent}" > ${testFile} && cat ${testFile}`,
       )
 
-      const result = spawnSync(command, {
+      const result = await execCommand(command, {
         shell: true,
-        encoding: 'utf8',
         cwd: TEST_DIR,
         timeout: 5000,
       })
@@ -1292,9 +1335,8 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
         'curl -s --max-time 5 http://example.com 2>&1',
       )
 
-      const result = spawnSync(command, {
+      const result = await execCommand(command, {
         shell: true,
-        encoding: 'utf8',
         timeout: 10000,
       })
 
@@ -1312,9 +1354,8 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
         'curl -s --max-time 2 http://anthropic.com 2>&1',
       )
 
-      const result = spawnSync(command, {
+      const result = await execCommand(command, {
         shell: true,
-        encoding: 'utf8',
         timeout: 5000,
       })
 
@@ -1347,9 +1388,8 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
         'curl -s --max-time 2 http://example.com 2>&1 || echo "blocked"',
       )
 
-      const result = spawnSync(command, {
+      const result = await execCommand(command, {
         shell: true,
-        encoding: 'utf8',
         timeout: 5000,
       })
 

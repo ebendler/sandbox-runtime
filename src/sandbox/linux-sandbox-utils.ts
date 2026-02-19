@@ -3,8 +3,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
-import { spawn } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
+import { execSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
@@ -30,10 +29,51 @@ import {
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
   socksSocketPath: string
-  httpBridgeProcess: ChildProcess
-  socksBridgeProcess: ChildProcess
+  httpBridgePid: number
+  socksBridgePid: number
   httpProxyPort: number
   socksProxyPort: number
+}
+
+/**
+ * Check if a process with the given PID is still alive.
+ */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Spawn a socat bridge process via double-fork so it is fully detached from
+ * the calling process tree.  This prevents the bun test runner (and similar
+ * harnesses) from discovering and killing the bridge between test cases.
+ *
+ * The shell invocation:
+ *   sh -c 'socat <args> & echo $!'
+ *
+ * 1. sh forks socat into the background (&)
+ * 2. sh prints the socat PID and exits immediately
+ * 3. socat is now orphaned and reparented to PID 1 – invisible to bun
+ *
+ * Returns the PID of the socat process.
+ */
+function spawnDetachedSocat(socatArgs: string[]): number {
+  const quotedArgs = shellquote.quote(['socat', ...socatArgs])
+  const cmd = `${quotedArgs} &\necho $!`
+  const output = execSync(cmd, {
+    shell: '/bin/sh',
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim()
+  const pid = parseInt(output, 10)
+  if (isNaN(pid) || pid <= 0) {
+    throw new Error(`Failed to parse socat PID from output: ${output}`)
+  }
+  return pid
 }
 
 export interface LinuxSandboxParams {
@@ -448,7 +488,10 @@ export async function initializeLinuxNetworkBridge(
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
   const socksSocketPath = join(tmpdir(), `claude-socks-${socketId}.sock`)
 
-  // Start HTTP bridge
+  // Start HTTP bridge via double-fork so the process is fully detached from
+  // the parent process tree.  This prevents the bun test runner from killing
+  // the bridge between test cases (it used to report "killed N dangling
+  // processes" which removed the socket files and broke subsequent tests).
   const httpSocatArgs = [
     `UNIX-LISTEN:${httpSocketPath},fork,reuseaddr`,
     `TCP:localhost:${httpProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
@@ -456,26 +499,16 @@ export async function initializeLinuxNetworkBridge(
 
   logForDebugging(`Starting HTTP bridge: socat ${httpSocatArgs.join(' ')}`)
 
-  const httpBridgeProcess = spawn('socat', httpSocatArgs, {
-    stdio: 'ignore',
-  })
-
-  if (!httpBridgeProcess.pid) {
-    throw new Error('Failed to start HTTP bridge process')
+  let httpBridgePid: number
+  try {
+    httpBridgePid = spawnDetachedSocat(httpSocatArgs)
+  } catch (err) {
+    throw new Error(`Failed to start HTTP bridge process: ${err}`)
   }
 
-  // Add error and exit handlers to monitor bridge health
-  httpBridgeProcess.on('error', err => {
-    logForDebugging(`HTTP bridge process error: ${err}`, { level: 'error' })
-  })
-  httpBridgeProcess.on('exit', (code, signal) => {
-    logForDebugging(
-      `HTTP bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
-    )
-  })
+  logForDebugging(`HTTP bridge started with PID ${httpBridgePid}`)
 
-  // Start SOCKS bridge
+  // Start SOCKS bridge (same double-fork approach)
   const socksSocatArgs = [
     `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
     `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
@@ -483,47 +516,29 @@ export async function initializeLinuxNetworkBridge(
 
   logForDebugging(`Starting SOCKS bridge: socat ${socksSocatArgs.join(' ')}`)
 
-  const socksBridgeProcess = spawn('socat', socksSocatArgs, {
-    stdio: 'ignore',
-  })
-
-  if (!socksBridgeProcess.pid) {
+  let socksBridgePid: number
+  try {
+    socksBridgePid = spawnDetachedSocat(socksSocatArgs)
+  } catch (err) {
     // Clean up HTTP bridge
-    if (httpBridgeProcess.pid) {
-      try {
-        process.kill(httpBridgeProcess.pid, 'SIGTERM')
-      } catch {
-        // Ignore errors
-      }
+    try {
+      process.kill(httpBridgePid, 'SIGTERM')
+    } catch {
+      // Ignore errors
     }
-    throw new Error('Failed to start SOCKS bridge process')
+    throw new Error(`Failed to start SOCKS bridge process: ${err}`)
   }
 
-  // Add error and exit handlers to monitor bridge health
-  socksBridgeProcess.on('error', err => {
-    logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
-  })
-  socksBridgeProcess.on('exit', (code, signal) => {
-    logForDebugging(
-      `SOCKS bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
-    )
-  })
+  logForDebugging(`SOCKS bridge started with PID ${socksBridgePid}`)
 
   // Wait for both sockets to be ready
-  const maxAttempts = 5
+  const maxAttempts = 10
   for (let i = 0; i < maxAttempts; i++) {
-    if (
-      !httpBridgeProcess.pid ||
-      httpBridgeProcess.killed ||
-      !socksBridgeProcess.pid ||
-      socksBridgeProcess.killed
-    ) {
+    if (!isProcessAlive(httpBridgePid) || !isProcessAlive(socksBridgePid)) {
       throw new Error('Linux bridge process died unexpectedly')
     }
 
     try {
-      // fs already imported
       if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSocketPath)) {
         logForDebugging(`Linux bridges ready after ${i + 1} attempts`)
         break
@@ -536,33 +551,29 @@ export async function initializeLinuxNetworkBridge(
 
     if (i === maxAttempts - 1) {
       // Clean up both processes
-      if (httpBridgeProcess.pid) {
-        try {
-          process.kill(httpBridgeProcess.pid, 'SIGTERM')
-        } catch {
-          // Ignore errors
-        }
+      try {
+        process.kill(httpBridgePid, 'SIGTERM')
+      } catch {
+        // Ignore errors
       }
-      if (socksBridgeProcess.pid) {
-        try {
-          process.kill(socksBridgeProcess.pid, 'SIGTERM')
-        } catch {
-          // Ignore errors
-        }
+      try {
+        process.kill(socksBridgePid, 'SIGTERM')
+      } catch {
+        // Ignore errors
       }
       throw new Error(
         `Failed to create bridge sockets after ${maxAttempts} attempts`,
       )
     }
 
-    await new Promise(resolve => setTimeout(resolve, i * 100))
+    await new Promise(resolve => setTimeout(resolve, 100 + i * 100))
   }
 
   return {
     httpSocketPath,
     socksSocketPath,
-    httpBridgeProcess,
-    socksBridgeProcess,
+    httpBridgePid,
+    socksBridgePid,
     httpProxyPort,
     socksProxyPort,
   }
@@ -578,7 +589,7 @@ function buildSandboxCommand(
   userCommand: string,
   seccompFilterPath: string | undefined,
   shell?: string,
-  applySeccompPath?: string,
+  writablePaths?: string[],
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
@@ -588,36 +599,94 @@ function buildSandboxCommand(
     'trap "kill %1 %2 2>/dev/null; exit" EXIT',
   ]
 
-  // If seccomp filter is provided, use apply-seccomp to apply it
+  // If seccomp filter is provided, use a nested bwrap to apply it
   if (seccompFilterPath) {
-    // apply-seccomp approach:
-    // 1. Outer bwrap/bash: starts socat processes (can use Unix sockets)
-    // 2. apply-seccomp: applies seccomp filter and execs user command
-    // 3. User command runs with seccomp active (Unix sockets blocked)
+    // Nested bwrap approach for seccomp isolation:
     //
-    // apply-seccomp is a simple C program that:
-    // - Sets PR_SET_NO_NEW_PRIVS
-    // - Applies the seccomp BPF filter via prctl(PR_SET_SECCOMP)
-    // - Execs the user command
+    // Stage 1: Outer bwrap/bash (already running, no seccomp):
+    //   - Starts socat processes that use socket(AF_UNIX,...) to connect to the
+    //     Unix socket bridges. These processes are NOT subject to seccomp.
     //
-    // This is simpler and more portable than nested bwrap, with no FD redirects needed.
-    const applySeccompBinary = getApplySeccompBinaryPath(applySeccompPath)
-    if (!applySeccompBinary) {
-      throw new Error(
-        'apply-seccomp binary not found. This should have been caught earlier. ' +
-          'Ensure vendor/seccomp/{x64,arm64}/apply-seccomp binaries are included in the package.',
-      )
+    // Stage 2: Inner bwrap (--share-net + --seccomp fd):
+    //   - Shares the outer bwrap's already-isolated network namespace, so the
+    //     user command can still reach socat's TCP listeners on :3128 / :1080.
+    //   - Applies the seccomp BPF filter via bwrap's --seccomp flag, which sets
+    //     PR_SET_NO_NEW_PRIVS and loads the filter before exec-ing the child.
+    //   - The user command (and only the user command) runs with Unix socket
+    //     creation blocked.
+    //
+    // This solves the critical bug with the old apply-seccomp approach:
+    //   When apply-seccomp called prctl(PR_SET_SECCOMP) and then exec'd the shell,
+    //   socat's fork() children (spawned on each new TCP connection) inherited the
+    //   seccomp filter. Those children then failed when trying to socket(AF_UNIX,...)
+    //   to relay traffic through the Unix bridge, causing all proxy responses to be
+    //   silently dropped and every proxied request to hang/timeout.
+    //
+    // With nested bwrap, the outer bash (and its socat children) never have the
+    // seccomp filter applied; only the inner bwrap's child process tree does.
+    //
+    // The inner bwrap uses:
+    //   --unshare-all   isolate all namespaces by default
+    //   --share-net     re-share the outer bwrap's network namespace (so socat
+    //                   TCP listeners on localhost:3128/1080 are reachable)
+    //   --ro-bind / /   inherit the outer bwrap's root filesystem view
+    //   --dev /dev      expose device nodes
+    //   --seccomp 3     load BPF filter from fd 3 (opened via shell redirection)
+    //
+    // The BPF filter file is opened onto fd 3 with a shell here-string redirect
+    // (`exec 3< filter.bpf`) before invoking bwrap, so bwrap can read it at
+    // startup (before exec-ing the child) and then close it.
+
+    // Build inner bwrap args: start with read-only root, then layer writable
+    // bind mounts on top so the user command can write to allowed directories.
+    // Without this the inner --ro-bind / / would shadow the outer bwrap's
+    // writable mounts and every write would fail with EROFS.
+    const innerBwrapArgs: string[] = [
+      'bwrap',
+      '--unshare-all',
+      '--share-net',
+      '--ro-bind',
+      '/',
+      '/',
+    ]
+
+    // Replicate writable bind mounts from the outer bwrap so writes succeed.
+    // Skip /dev/* paths since --dev /dev already handles them (and paths like
+    // /dev/stdout are symlinks that may not resolve inside the nested namespace).
+    if (writablePaths) {
+      for (const p of writablePaths) {
+        if (p.startsWith('/dev/') || p === '/dev') {
+          continue
+        }
+        if (fs.existsSync(p)) {
+          innerBwrapArgs.push('--bind', p, p)
+        }
+      }
     }
 
-    const applySeccompCmd = shellquote.quote([
-      applySeccompBinary,
-      seccompFilterPath,
+    innerBwrapArgs.push(
+      '--dev',
+      '/dev',
+      '--seccomp',
+      '3',
+      '--',
       shellPath,
       '-c',
       userCommand,
-    ])
+    )
 
-    const innerScript = [...socatCommands, applySeccompCmd].join('\n')
+    const innerBwrapCmd = shellquote.quote(innerBwrapArgs)
+
+    // Open the BPF filter onto fd 3 before calling inner bwrap
+    const innerScript = [
+      ...socatCommands,
+      // Wait a moment for socat listeners to be ready before starting the
+      // user command, ensuring proxy traffic can flow immediately.
+      'sleep 0.1',
+      `exec 3< ${shellquote.quote([seccompFilterPath])}`,
+      innerBwrapCmd,
+    ].join('\n')
+
     return `${shellPath} -c ${shellquote.quote([innerScript])}`
   } else {
     // No seccomp filter - run user command directly
@@ -857,24 +926,35 @@ async function generateFilesystemArgs(
 /**
  * Wrap a command with sandbox restrictions on Linux
  *
- * UNIX SOCKET BLOCKING (APPLY-SECCOMP):
- * This implementation uses a custom apply-seccomp binary to block Unix domain socket
- * creation for user commands while allowing network infrastructure:
+ * UNIX SOCKET BLOCKING (SECCOMP):
+ * This implementation blocks Unix domain socket creation for user commands while
+ * allowing the network infrastructure (socat bridges) to operate freely.
  *
- * Stage 1: Outer bwrap - Network and filesystem isolation (NO seccomp)
+ * When network restrictions are active (needsNetworkRestriction === true):
+ *
+ * Stage 1: Outer bwrap/bash - Network and filesystem isolation (NO seccomp)
  *   - Bubblewrap starts with isolated network namespace (--unshare-net)
  *   - Bubblewrap applies PID namespace isolation (--unshare-pid and --proc)
  *   - Filesystem restrictions are applied (read-only mounts, bind mounts, etc.)
  *   - Socat processes start and connect to Unix socket bridges (can use socket(AF_UNIX, ...))
  *
- * Stage 2: apply-seccomp - Seccomp filter application (ONLY seccomp)
- *   - apply-seccomp binary applies seccomp filter via prctl(PR_SET_SECCOMP)
- *   - Sets PR_SET_NO_NEW_PRIVS to allow seccomp without root
- *   - Execs user command with seccomp active (cannot create new Unix sockets)
+ * Stage 2: Inner (nested) bwrap - Seccomp filter application
+ *   - A second bwrap is launched inside the outer shell with --share-net (to
+ *     reuse the outer network namespace so socat's TCP listeners are reachable)
+ *   - The seccomp BPF filter is loaded via bwrap's --seccomp flag, which sets
+ *     PR_SET_NO_NEW_PRIVS and applies the filter before exec-ing the child
+ *   - Writable bind mounts from the outer bwrap are replicated so writes succeed
+ *   - Only the user command (and its children) run with seccomp active
  *
- * This solves the conflict between:
- * - Security: Blocking arbitrary Unix socket creation in user commands
- * - Functionality: Network sandboxing requires socat to call socket(AF_UNIX, ...) for bridge connections
+ * This nested-bwrap approach solves a critical bug with the previous apply-seccomp
+ * binary approach: when apply-seccomp called prctl(PR_SET_SECCOMP) and then exec'd
+ * the shell, socat's fork() children (spawned per TCP connection) inherited the
+ * seccomp filter. Those children then failed when calling socket(AF_UNIX, ...) to
+ * relay traffic through the Unix bridge, silently dropping all proxy responses.
+ *
+ * When network restrictions are NOT active but seccomp is needed:
+ *   - The apply-seccomp binary is used directly since there are no socat processes
+ *     whose children could inherit the filter.
  *
  * The seccomp-bpf filter blocks socket(AF_UNIX, ...) syscalls, preventing:
  * - Creating new Unix domain socket file descriptors
@@ -893,9 +973,10 @@ async function generateFilesystemArgs(
  * because seccomp-bpf cannot inspect user-space memory to read socket paths.
  *
  * Requirements for seccomp filtering:
- * - Pre-built apply-seccomp binaries are included for x64 and ARM64
+ * - Pre-built apply-seccomp binaries are included for x64 and ARM64 (used in
+ *   the non-network-restricted path)
  * - Pre-generated BPF filters are included for x64 and ARM64
- * - Other architectures are not currently supported (no apply-seccomp binary available)
+ * - Other architectures are not currently supported
  * - To use sandboxing without Unix socket blocking on unsupported architectures,
  *   set allowAllUnixSockets: true in your configuration
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
@@ -1084,15 +1165,24 @@ export async function wrapCommandWithSandboxLinux(
     // If we have network restrictions, use the network bridge setup with apply-seccomp for seccomp
     // Otherwise, just run the command directly with apply-seccomp if needed
     if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
-      // Pass seccomp filter to buildSandboxCommand for apply-seccomp application
-      // This allows socat to start before seccomp is applied
+      // Pass seccomp filter to buildSandboxCommand for nested-bwrap application.
+      // buildSandboxCommand starts socat bridges first (no seccomp), then launches
+      // a nested bwrap with --share-net + --seccomp so only the user command is
+      // subject to Unix socket blocking.
+      // Collect writable paths so the inner bwrap can replicate them.
+      // writeConfig.allowOnly already contains every path the outer bwrap
+      // mounts as --bind (writable), so we just forward the list.
+      const writablePaths = (writeConfig?.allowOnly ?? [])
+        .map(p => normalizePathForSandbox(p))
+        .filter(p => fs.existsSync(p))
+
       const sandboxCommand = buildSandboxCommand(
         httpSocketPath,
         socksSocketPath,
         command,
         seccompFilterPath,
         shell,
-        seccompConfig?.applyPath,
+        writablePaths,
       )
       bwrapArgs.push(sandboxCommand)
     } else if (seccompFilterPath) {

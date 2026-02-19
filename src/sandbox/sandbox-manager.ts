@@ -20,6 +20,7 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
+  isProcessAlive,
 } from './linux-sandbox-utils.js'
 import {
   wrapCommandWithSandboxMacOS,
@@ -669,98 +670,54 @@ async function reset(): Promise<void> {
   }
 
   if (managerContext?.linuxBridge) {
-    const {
-      httpSocketPath,
-      socksSocketPath,
-      httpBridgeProcess,
-      socksBridgeProcess,
-    } = managerContext.linuxBridge
+    const { httpSocketPath, socksSocketPath, httpBridgePid, socksBridgePid } =
+      managerContext.linuxBridge
 
-    // Create array to wait for process exits
-    const exitPromises: Promise<void>[] = []
+    // Helper: kill a bridge process (SIGTERM, then SIGKILL after timeout)
+    const killBridge = async (pid: number, label: string): Promise<void> => {
+      if (!isProcessAlive(pid)) {
+        logForDebugging(`${label} bridge (PID ${pid}) already dead`)
+        return
+      }
 
-    // Kill HTTP bridge and wait for it to exit
-    if (httpBridgeProcess.pid && !httpBridgeProcess.killed) {
       try {
-        process.kill(httpBridgeProcess.pid, 'SIGTERM')
-        logForDebugging('Sent SIGTERM to HTTP bridge process')
-
-        // Wait for process to exit
-        exitPromises.push(
-          new Promise<void>(resolve => {
-            httpBridgeProcess.once('exit', () => {
-              logForDebugging('HTTP bridge process exited')
-              resolve()
-            })
-            // Timeout after 5 seconds
-            setTimeout(() => {
-              if (!httpBridgeProcess.killed) {
-                logForDebugging('HTTP bridge did not exit, forcing SIGKILL', {
-                  level: 'warn',
-                })
-                try {
-                  if (httpBridgeProcess.pid) {
-                    process.kill(httpBridgeProcess.pid, 'SIGKILL')
-                  }
-                } catch {
-                  // Process may have already exited
-                }
-              }
-              resolve()
-            }, 5000)
-          }),
-        )
+        process.kill(pid, 'SIGTERM')
+        logForDebugging(`Sent SIGTERM to ${label} bridge (PID ${pid})`)
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-          logForDebugging(`Error killing HTTP bridge: ${err}`, {
+          logForDebugging(`Error killing ${label} bridge: ${err}`, {
             level: 'error',
           })
         }
+        return
       }
-    }
 
-    // Kill SOCKS bridge and wait for it to exit
-    if (socksBridgeProcess.pid && !socksBridgeProcess.killed) {
-      try {
-        process.kill(socksBridgeProcess.pid, 'SIGTERM')
-        logForDebugging('Sent SIGTERM to SOCKS bridge process')
-
-        // Wait for process to exit
-        exitPromises.push(
-          new Promise<void>(resolve => {
-            socksBridgeProcess.once('exit', () => {
-              logForDebugging('SOCKS bridge process exited')
-              resolve()
-            })
-            // Timeout after 5 seconds
-            setTimeout(() => {
-              if (!socksBridgeProcess.killed) {
-                logForDebugging('SOCKS bridge did not exit, forcing SIGKILL', {
-                  level: 'warn',
-                })
-                try {
-                  if (socksBridgeProcess.pid) {
-                    process.kill(socksBridgeProcess.pid, 'SIGKILL')
-                  }
-                } catch {
-                  // Process may have already exited
-                }
-              }
-              resolve()
-            }, 5000)
-          }),
-        )
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-          logForDebugging(`Error killing SOCKS bridge: ${err}`, {
-            level: 'error',
-          })
+      // Poll for process exit (up to 5 seconds)
+      const deadline = Date.now() + 5000
+      while (Date.now() < deadline) {
+        if (!isProcessAlive(pid)) {
+          logForDebugging(`${label} bridge (PID ${pid}) exited`)
+          return
         }
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+
+      // Process didn't exit in time – force kill
+      logForDebugging(`${label} bridge did not exit, forcing SIGKILL`, {
+        level: 'warn',
+      })
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        // Process may have already exited
       }
     }
 
-    // Wait for both processes to exit
-    await Promise.all(exitPromises)
+    // Kill both bridge processes in parallel
+    await Promise.all([
+      killBridge(httpBridgePid, 'HTTP'),
+      killBridge(socksBridgePid, 'SOCKS'),
+    ])
 
     // Clean up sockets
     if (httpSocketPath) {
