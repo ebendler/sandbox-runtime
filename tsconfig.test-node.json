@@ -1,0 +1,26 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "noEmit": false,
+        "noUnusedLocals": false,
+        "noUnusedParameters": false,
+        "declaration": false,
+        "declarationMap": false,
+        "sourceMap": false,
+        "rootDir": "./test-node",
+        "outDir": "./dist-test-node",
+        "allowJs": true,
+        "checkJs": false,
+        "types": [
+            "node"
+        ]
+    },
+    "include": [
+        "test-node/**/*"
+    ],
+    "exclude": [
+        "node_modules",
+        "dist",
+        "dist-test-node"
+    ]
+}

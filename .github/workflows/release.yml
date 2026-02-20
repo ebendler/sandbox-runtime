@@ -12,9 +12,10 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    environment: npm
+    environment:
+      name: npm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -35,12 +36,12 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '18'
           registry-url: 'https://registry.npmjs.org'
 
-      - run: npm install
+      - run: npm ci
       - run: npm run clean && npm run build
 
       - name: Publish to npm

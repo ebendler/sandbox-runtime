@@ -2,13 +2,45 @@ name: Tests
 
 on:
   push:
-    branches: [ "**" ]
+    branches: ['**']
   pull_request:
-    branches: [ "**" ]
+    branches: ['**']
 
 jobs:
-  integration-tests:
-    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})
+  build:
+    name: Build (shared)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
+
+      - name: Build Node test bundle
+        run: npm run build:test-node
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-artifacts
+          path: |
+            dist/
+            dist-test-node/
+          if-no-files-found: error
+
+  bun-tests:
+    name: Bun Tests (${{ matrix.os }} / ${{ matrix.arch }})
+    needs: build
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -30,12 +62,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: '18'
+          node-version: '20'
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -66,25 +98,123 @@ jobs:
           brew install ripgrep zsh
 
       - name: Install Node dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Build project
-        run: npm run build
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: build-artifacts
+          path: .
 
-      - name: Run unit tests
+      - name: Run Bun unit tests
         run: npm run test:unit
 
-      - name: Run Node.js fallback tests
-        run: node test/utils/which-node-test.mjs
-
-      - name: Run integration tests
+      - name: Run Bun integration tests
         run: npm run test:integration
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: test-results-${{ matrix.os }}-${{ matrix.arch }}
+          name: test-results-bun-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            test-results/
+            *.log
+          if-no-files-found: ignore
+
+  node-tests:
+    name: Node ${{ matrix.node-version }} Tests (${{ matrix.os }} / ${{ matrix.arch }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-latest
+            os: linux
+            node-version: '18'
+          - arch: x86-64
+            runner: ubuntu-latest
+            os: linux
+            node-version: '20'
+          - arch: x86-64
+            runner: ubuntu-latest
+            os: linux
+            node-version: '22'
+          - arch: x86-64
+            runner: ubuntu-latest
+            os: linux
+            node-version: '24'
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            os: linux
+            node-version: '24'
+          - arch: x86-64
+            runner: macos-15-large
+            os: macos
+            node-version: '24'
+          - arch: arm64
+            runner: macos-14
+            os: macos
+            node-version: '24'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install system dependencies (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat ripgrep apparmor-profiles zsh
+
+      - name: Enable unprivileged user namespaces (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          # Ubuntu 24.04+ restricts unprivileged user namespaces by default
+          # Set setuid bit on bwrap to allow namespace creation
+          echo "Setting setuid bit on bwrap..."
+          sudo chmod u+s $(which bwrap)
+
+          # Verify bwrap can create namespaces
+          echo "Testing bwrap namespace creation..."
+          bwrap --ro-bind / / --unshare-net true && echo "✓ bwrap namespace creation works" || echo "✗ bwrap namespace creation still fails"
+
+      - name: Install system dependencies (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          brew install ripgrep zsh
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: build-artifacts
+          path: .
+
+      - name: Run Node.js unit tests
+        run: node --test dist-test-node/config-validation.test.js dist-test-node/sandbox/seccomp-filter.test.js
+
+      - name: Run Node.js fallback tests
+        run: node test-node/utils/which-node-test.mjs
+
+      - name: Run Node.js integration tests
+        run: node --test dist-test-node/sandbox/integration.test.js
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results-node${{ matrix.node-version }}-${{ matrix.os }}-${{ matrix.arch }}
           path: |
             test-results/
             *.log

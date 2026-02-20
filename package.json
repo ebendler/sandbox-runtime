@@ -9,16 +9,20 @@
     "srt": "dist/cli.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.19"
   },
   "scripts": {
     "build": "tsc",
+    "build:test-node": "tsc -p tsconfig.test-node.json",
     "postbuild": "[ -d vendor ] && cp -r vendor dist/ || true",
     "build:seccomp": "scripts/build-seccomp-binaries.sh",
-    "clean": "rm -rf dist",
+    "clean": "rm -rf dist dist-test-node",
     "test": "bun test",
     "test:unit": "bun test test/config-validation.test.ts test/sandbox/seccomp-filter.test.ts",
     "test:integration": "bun test test/sandbox/integration.test.ts",
+    "test:node": "npm run -s build && npm run -s build:test-node && node --test dist-test-node/**/*.test.js",
+    "test:unit:node": "npm run -s build && npm run -s build:test-node && node --test dist-test-node/config-validation.test.js dist-test-node/sandbox/seccomp-filter.test.js",
+    "test:integration:node": "npm run -s build && npm run -s build:test-node && node --test dist-test-node/sandbox/integration.test.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint 'src/**/*.ts' --fix --cache --cache-location=node_modules/.cache/.eslintcache",
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",
@@ -29,28 +33,28 @@
   "dependencies": {
     "@pondwader/socks5-server": "^1.0.10",
     "@types/lodash-es": "^4.17.12",
-    "commander": "^12.1.0",
+    "commander": "^13.1.0",
     "lodash-es": "^4.17.23",
     "shell-quote": "^1.8.3",
-    "zod": "^3.24.1"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@eslint/js": "^9.14.0",
+    "@eslint/js": "^9.39.3",
     "@types/bun": "^1.3.2",
     "@types/node": "^18",
     "@types/shell-quote": "^1.7.5",
-    "eslint": "^9.14.0",
-    "eslint-config-prettier": "^8.10.0",
-    "eslint-import-resolver-typescript": "^3.6.3",
-    "eslint-plugin-import": "^2.31.0",
-    "eslint-plugin-n": "^17.16.2",
-    "eslint-plugin-prettier": "^5.1.3",
-    "globals": "^15.12.0",
+    "eslint": "^9.39.3",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-import-resolver-typescript": "^4.4.4",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-n": "^17.24.0",
+    "eslint-plugin-prettier": "^5.5.5",
+    "globals": "^17.3.0",
     "husky": "^9.1.7",
-    "lint-staged": "^16.2.6",
-    "prettier": "3.3.3",
-    "typescript": "^5.6.3",
-    "typescript-eslint": "^8.13.0"
+    "lint-staged": "^15.5.2",
+    "prettier": "3.8.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "8.55.0"
   },
   "files": [
     "dist",

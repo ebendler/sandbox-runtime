@@ -7,7 +7,14 @@ import prettierRecommended from 'eslint-plugin-prettier/recommended'
 
 export default [
   {
-    ignores: ['node_modules/', 'dist/', '**/*.d.ts'],
+    ignores: [
+      'node_modules/',
+      'dist/',
+      'dist-test-node/',
+      '**/*.d.ts',
+      'test-node/**/*.js',
+      'test-node/**/*.mjs',
+    ],
   },
   {
     files: ['**/*.{js,ts}'],
@@ -30,6 +37,15 @@ export default [
     languageOptions: {
       parserOptions: {
         project: './tsconfig.test.json',
+        projectService: false,
+      },
+    },
+  },
+  {
+    files: ['test-node/**/*.ts'],
+    languageOptions: {
+      parserOptions: {
+        project: './tsconfig.test-node.json',
         projectService: false,
       },
     },
@@ -110,6 +126,12 @@ export default [
     },
     linterOptions: {
       reportUnusedDisableDirectives: false,
+    },
+  },
+  {
+    files: ['test-node/**/*.ts'],
+    rules: {
+      '@typescript-eslint/no-floating-promises': 'off',
     },
   },
   prettierRecommended,

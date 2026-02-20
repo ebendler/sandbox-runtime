@@ -287,10 +287,10 @@ Uses an **allow-only pattern** - all network access is denied by default.
 
 **Unix Socket Settings** (platform-specific behavior):
 
-| Setting | macOS | Linux |
-|---------|-------|-------|
-| `allowUnixSockets: string[]` | Allowlist of socket paths | *Ignored* (seccomp can't filter by path) |
-| `allowAllUnixSockets: boolean` | Allow all sockets | Disable seccomp blocking |
+| Setting                        | macOS                     | Linux                                    |
+| ------------------------------ | ------------------------- | ---------------------------------------- |
+| `allowUnixSockets: string[]`   | Allowlist of socket paths | _Ignored_ (seccomp can't filter by path) |
+| `allowAllUnixSockets: boolean` | Allow all sockets         | Disable seccomp blocking                 |
 
 Unix sockets are **blocked by default** on both platforms.
 
@@ -444,11 +444,14 @@ npm run build
 # Build seccomp binaries (requires Docker)
 npm run build:seccomp
 
-# Run tests
+# Run tests with Bun
 npm test
-
-# Run integration tests
 npm run test:integration
+
+# Run tests with Node.js (Node 18+)
+npm run test:node
+npm run test:unit:node
+npm run test:integration:node
 
 # Type checking
 npm run typecheck
@@ -501,7 +504,6 @@ Filesystem restrictions are enforced at the OS level:
 **Default filesystem permissions:**
 
 - **Read** (deny-only): Allowed everywhere by default. You can deny specific paths.
-
   - Example: `denyRead: ["~/.ssh"]` to block access to SSH keys
   - Empty `denyRead: []` = full read access (nothing denied)
 
