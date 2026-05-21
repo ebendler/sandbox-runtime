@@ -8,6 +8,7 @@ export type {
   NetworkConfig,
   FilesystemConfig,
   IgnoreViolationsConfig,
+  HardwareConfig,
 } from './sandbox/sandbox-config.js'
 
 export {
@@ -16,6 +17,7 @@ export {
   FilesystemConfigSchema,
   IgnoreViolationsConfigSchema,
   RipgrepConfigSchema,
+  HardwareConfigSchema,
 } from './sandbox/sandbox-config.js'
 
 // Schema types and utilities
@@ -39,6 +41,9 @@ export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'
+
+// CUDA passthrough helpers
+export { detectCudaAvailable } from './sandbox/linux-sandbox-utils.js'
 
 // Platform utilities
 export { getWslVersion } from './utils/platform.js'

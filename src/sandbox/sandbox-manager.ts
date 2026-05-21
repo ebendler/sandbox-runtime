@@ -20,6 +20,7 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
+  discoverCudaDevices,
 } from './linux-sandbox-utils.js'
 import {
   wrapCommandWithSandboxMacOS,
@@ -63,6 +64,7 @@ let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
+let cudaDevicesCache: string[] = []
 const sandboxViolationStore = new SandboxViolationStore()
 
 // ============================================================================
@@ -299,6 +301,11 @@ async function initialize(
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
     )
+  }
+
+  // Discover CUDA devices on Linux once at initialization
+  if (getPlatform() === 'linux') {
+    cudaDevicesCache = discoverCudaDevices()
   }
 
   // Start log monitor for macOS if enabled
@@ -741,6 +748,8 @@ async function wrapWithSandbox(
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        cudaEnabled: config?.hardware?.cuda === true,
+        cudaDevices: cudaDevicesCache,
         abortSignal,
       })
 
@@ -984,6 +993,7 @@ async function reset(): Promise<void> {
   initializationPromise = undefined
   parentProxy = undefined
   mitmCA = undefined
+  cudaDevicesCache = []
 }
 
 function getSandboxViolationStore() {

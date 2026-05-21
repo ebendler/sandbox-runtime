@@ -342,6 +342,45 @@ Examples:
 - Paths can be absolute (e.g., `/home/user/.ssh`) or relative to the current working directory (e.g., `./src`)
 - `~` expands to the user's home directory
 
+#### Hardware Passthrough (Linux only)
+
+Opt-in NVIDIA CUDA compute device passthrough. Off by default. macOS ignores the
+flag.
+
+```json
+{
+  "hardware": { "cuda": true }
+}
+```
+
+When `hardware.cuda` is `true` on Linux, the following compute-only NVIDIA
+device nodes are bound into the sandbox via `--dev-bind-try`:
+
+- `/dev/nvidiactl`
+- `/dev/nvidia-uvm`
+- `/dev/nvidia-uvm-tools`
+- `/dev/nvidia-caps`
+- `/dev/nvidia<N>` (each compute device discovered at sandbox initialization)
+
+Display-oriented nodes are intentionally excluded: `/dev/nvidia-modeset`,
+`/dev/dri/*`. Missing nodes are non-fatal — `--dev-bind-try` skips them, and
+CUDA programs fail at their normal runtime path if devices are unavailable.
+
+Library consumers can probe for CUDA support before enabling the flag:
+
+```typescript
+import { detectCudaAvailable } from '@anthropic-ai/sandbox-runtime'
+
+const config = {
+  // ...
+  hardware: { cuda: detectCudaAvailable() },
+}
+```
+
+**Security note:** CUDA driver passthrough exposes the host's NVIDIA kernel
+driver to the sandboxed workload. Only enable this when the workload actually
+needs GPU compute access. The seccomp filter does not block NVIDIA ioctls.
+
 #### Other Configuration
 
 - `ignoreViolations` - Object mapping command patterns to arrays of paths where violations should be ignored

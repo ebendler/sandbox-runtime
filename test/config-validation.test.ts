@@ -365,4 +365,51 @@ describe('Config Validation', () => {
       expect(result.success).toBe(false)
     })
   })
+
+  describe('hardware block', () => {
+    const baseConfig = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    test('accepts missing hardware block', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse(baseConfig)
+      expect(result.success).toBe(true)
+    })
+
+    test('accepts hardware.cuda = true', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...baseConfig,
+        hardware: { cuda: true },
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.hardware?.cuda).toBe(true)
+      }
+    })
+
+    test('accepts hardware.cuda = false', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...baseConfig,
+        hardware: { cuda: false },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('accepts empty hardware block (cuda defaults to undefined)', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...baseConfig,
+        hardware: {},
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects non-boolean hardware.cuda', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...baseConfig,
+        hardware: { cuda: 'yes' },
+      })
+      expect(result.success).toBe(false)
+    })
+  })
 })

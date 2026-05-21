@@ -296,6 +296,26 @@ export const SeccompConfigSchema = z.object({
 })
 
 /**
+ * Hardware passthrough configuration.
+ *
+ * v1 supports NVIDIA CUDA compute devices on Linux only. The flag is silently
+ * ignored on macOS (matches the precedent of allowUnixSockets being Linux-
+ * ignored). Missing block is equivalent to `{ cuda: false }`.
+ */
+export const HardwareConfigSchema = z.object({
+  cuda: z
+    .boolean()
+    .optional()
+    .describe(
+      'Linux only: when true, bind compute-only NVIDIA device nodes ' +
+        '(/dev/nvidiactl, /dev/nvidia-uvm, /dev/nvidia-uvm-tools, ' +
+        '/dev/nvidia-caps, /dev/nvidia<N>) into the bwrap sandbox via ' +
+        '--dev-bind-try. Display-oriented nodes (/dev/nvidia-modeset, ' +
+        '/dev/dri) are intentionally excluded. macOS ignores this flag.',
+    ),
+})
+
+/**
  * Main configuration schema for Sandbox Runtime validation
  */
 export const SandboxRuntimeConfigSchema = z.object({
@@ -351,6 +371,9 @@ export const SandboxRuntimeConfigSchema = z.object({
       'Linux only: absolute path to the socat binary. ' +
         'When set, this path is used directly instead of resolving "socat" via PATH.',
     ),
+  hardware: HardwareConfigSchema.optional().describe(
+    'Optional hardware passthrough configuration (currently NVIDIA CUDA on Linux).',
+  ),
 })
 
 // Export inferred types
@@ -363,4 +386,5 @@ export type IgnoreViolationsConfig = z.infer<
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type HardwareConfig = z.infer<typeof HardwareConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

@@ -22,6 +22,7 @@ import type {
 } from './sandbox-schemas.js'
 import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
 import type { SeccompConfig } from './sandbox-config.js'
+import { getPlatform } from '../utils/platform.js'
 
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
@@ -59,10 +60,76 @@ export interface LinuxSandboxParams {
   socatPath?: string
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
+  /** Linux only: when true, bind NVIDIA compute device nodes into the sandbox. */
+  cudaEnabled?: boolean
+  /**
+   * Linux only: the device-node paths to attempt --dev-bind-try for when
+   * cudaEnabled is true. Caller computes this once at initialize() via
+   * discoverCudaDevices() to avoid per-wrap filesystem scans. Defaulted to
+   * an empty array if unset.
+   */
+  cudaDevices?: string[]
 }
 
 /** Default max depth for searching dangerous files */
 const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
+
+// ============================================================================
+// CUDA device passthrough
+// ============================================================================
+
+/**
+ * NVIDIA compute device nodes that are always bound (via --dev-bind-try)
+ * when hardware.cuda is enabled. Display-oriented nodes are intentionally
+ * excluded — see spec docs/superpowers/specs/2026-05-19-cuda-passthrough-design.md.
+ */
+const CUDA_FIXED_NODES = [
+  '/dev/nvidiactl',
+  '/dev/nvidia-uvm',
+  '/dev/nvidia-uvm-tools',
+  '/dev/nvidia-caps',
+] as const
+
+/**
+ * Returns the list of NVIDIA device nodes to bind into the sandbox when
+ * hardware.cuda is enabled. Combines the fixed compute-control nodes with
+ * any discovered /dev/nvidia<N> device entries. Discovery never throws —
+ * EACCES or other readdir failures on locked-down hosts are treated as an
+ * empty indexed list, and the fixed nodes are still emitted (the caller
+ * uses --dev-bind-try so missing nodes are non-fatal).
+ */
+export function discoverCudaDevices(): string[] {
+  if (getPlatform() !== 'linux') return []
+  let indexed: string[] = []
+  try {
+    indexed = fs
+      .readdirSync('/dev')
+      .filter(n => /^nvidia\d+$/.test(n))
+      .sort((a, b) => {
+        const ai = Number((a.match(/\d+$/) ?? ['0'])[0])
+        const bi = Number((b.match(/\d+$/) ?? ['0'])[0])
+        return ai - bi
+      })
+      .map(n => '/dev/' + n)
+  } catch {
+    // intentionally swallowed; see docstring
+  }
+  return [...CUDA_FIXED_NODES, ...indexed]
+}
+
+/**
+ * Cheap probe library consumers can call to decide whether to set
+ * `hardware.cuda = true`. Returns true only on Linux and only when
+ * /dev/nvidiactl exists. Does not dlopen libcuda.
+ */
+export function detectCudaAvailable(): boolean {
+  if (getPlatform() !== 'linux') return false
+  try {
+    return fs.existsSync('/dev/nvidiactl')
+  } catch {
+    return false
+  }
+}
 
 /**
  * Find if any component of the path is a symlink within the allowed write paths.
@@ -1082,6 +1149,8 @@ export async function wrapCommandWithSandboxLinux(
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     allowGitConfig = false,
+    cudaEnabled = false,
+    cudaDevices = [],
     seccompConfig,
     bwrapPath,
     socatPath,
@@ -1219,6 +1288,18 @@ export async function wrapCommandWithSandboxLinux(
 
     // Always bind /dev
     bwrapArgs.push('--dev', '/dev')
+
+    // ========== CUDA DEVICE PASSTHROUGH (NVIDIA, compute-only) ==========
+    // Display-oriented nodes (/dev/nvidia-modeset, /dev/dri/*) are
+    // intentionally excluded. The caller (SandboxManager) computes the
+    // device list via discoverCudaDevices() at initialize() time. We use
+    // --dev-bind-try so a missing node (stale cache, partial host, node
+    // disappeared between discovery and exec) is non-fatal.
+    if (cudaEnabled && cudaDevices.length > 0) {
+      for (const devicePath of cudaDevices) {
+        bwrapArgs.push('--dev-bind-try', devicePath, devicePath)
+      }
+    }
 
     // ========== PID NAMESPACE ISOLATION ==========
     // IMPORTANT: These must come AFTER filesystem binds for nested bwrap to work
