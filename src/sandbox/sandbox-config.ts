@@ -7,6 +7,7 @@ import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
+import { isQualifiedName } from '@cncf-tags/container-device-interface'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -278,6 +279,51 @@ export const RipgrepConfigSchema = z.object({
 })
 
 /**
+ * Windows-specific configuration schema. See
+ * `windows-sandbox-utils.ts` for the install flow these settings
+ * must agree with.
+ */
+export const WindowsConfigSchema = z.object({
+  groupName: z
+    .string()
+    .min(1)
+    .default('sandbox-runtime-net')
+    .describe(
+      'Discriminator group name. Must match the group created at install ' +
+        'time. Ignored if groupSid is set.',
+    ),
+  groupSid: z
+    .string()
+    .regex(/^S-1-/, 'must be an S-1-… SID string')
+    .optional()
+    .describe(
+      'Discriminator group SID. Overrides groupName lookup — use for ' +
+        'domain groups or where name resolution is unreliable.',
+    ),
+  wfpSublayerGuid: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'WFP sublayer GUID under which the filters were installed. Omit to ' +
+        'use the srt-win compile-time default. Set this when filters were ' +
+        'installed by enterprise tooling under a custom sublayer.',
+    ),
+  proxyPortRange: z
+    .tuple([z.number().int().min(1), z.number().int().max(65535)])
+    .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {
+      message: 'low must be ≤ high and range width ≤ 64',
+    })
+    .optional()
+    .describe(
+      'Inclusive [low, high] port range the JS http/socks proxies bind ' +
+        'inside. MUST match the range passed to `srt-win wfp install ' +
+        '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
+        'permit only covers ports in that range.',
+    ),
+})
+
+/**
  * Seccomp configuration schema (Linux only)
  */
 export const SeccompConfigSchema = z.object({
@@ -293,6 +339,57 @@ export const SeccompConfigSchema = z.object({
         'applyPath resolves inside the bwrap namespace and that the target ' +
         'binary implements the apply-seccomp interface when ARGV0 matches.',
     ),
+})
+
+/**
+ * Schema for a CDI device pattern. Accepts either:
+ *   - an exact FQDN per the CDI spec (e.g. "nvidia.com/gpu=0"), validated by
+ *     the upstream `isQualifiedName` helper, or
+ *   - a trailing-wildcard pattern (`kind=*`) where the kind portion is a valid
+ *     CDI kind (e.g. "nvidia.com/gpu=*").
+ */
+const cdiPatternSchema = z.string().refine(
+  val => {
+    if (val.endsWith('=*')) {
+      const kind = val.slice(0, -2)
+      return isQualifiedName(`${kind}=dummy`)
+    }
+    return isQualifiedName(val)
+  },
+  {
+    message:
+      'Invalid CDI pattern. Must be an exact FQDN (e.g. "vendor.com/kind=0") or a trailing-wildcard form ("vendor.com/kind=*").',
+  },
+)
+
+const cdiRequestedDeviceSchema = z
+  .string()
+  .refine(val => isQualifiedName(val), {
+    message:
+      'Invalid CDI requested device. Must be a fully qualified name like "vendor.com/kind=0".',
+  })
+
+export const CdiConfigSchema = z.object({
+  specDirs: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'Directories to scan for CDI specs. Defaults to ["/etc/cdi", "/var/run/cdi"] when omitted.',
+    ),
+  requestedDevices: z
+    .array(cdiRequestedDeviceSchema)
+    .optional()
+    .describe('Fully qualified CDI device names to inject into the sandbox.'),
+  allowDevices: z
+    .array(cdiPatternSchema)
+    .optional()
+    .describe(
+      'Admin allowlist of patterns. Omitted = allow all requested. Empty = allow none.',
+    ),
+  denyDevices: z
+    .array(cdiPatternSchema)
+    .optional()
+    .describe('Admin denylist of patterns. Denial takes precedence.'),
 })
 
 /**
@@ -351,9 +448,16 @@ export const SandboxRuntimeConfigSchema = z.object({
       'Linux only: absolute path to the socat binary. ' +
         'When set, this path is used directly instead of resolving "socat" via PATH.',
     ),
+  windows: WindowsConfigSchema.optional().describe(
+    'Windows-specific settings (group, WFP sublayer, proxy port range).',
+  ),
+  cdi: CdiConfigSchema.optional().describe(
+    'Optional CDI device passthrough configuration (Linux only).',
+  ),
 })
 
 // Export inferred types
+export type CdiConfig = z.infer<typeof CdiConfigSchema>
 export type MitmProxyConfig = z.infer<typeof MitmProxyConfigSchema>
 export type ParentProxyConfig = z.infer<typeof ParentProxyConfigSchema>
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
@@ -363,4 +467,5 @@ export type IgnoreViolationsConfig = z.infer<
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

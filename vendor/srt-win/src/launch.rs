@@ -10,7 +10,6 @@
 //! loopback permit installed by `srt-win wfp install`.
 
 use anyhow::{anyhow, Context, Result};
-use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::path::Path;
@@ -122,13 +121,6 @@ pub struct ExecSpec<'a> {
     /// Discriminator group SID (already resolved by the caller from
     /// `--name` / `--group-sid`).
     pub group_sid: &'a str,
-    /// JS-side HTTP proxy port. When set, `HTTP_PROXY` /
-    /// `HTTPS_PROXY` (and lowercase) are pointed at it.
-    pub http_proxy: Option<u16>,
-    /// JS-side SOCKS proxy port. When set, `ALL_PROXY` (and
-    /// lowercase) is pointed at `socks5h://` so DNS resolves at
-    /// the proxy.
-    pub socks_proxy: Option<u16>,
     /// Skip the "is `group_sid` enabled in the broker's token"
     /// pre-flight check. **Fail-open** — the WFP fence relies on
     /// the broker having the group enabled; with this set the
@@ -214,8 +206,10 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
     // 5) Window station + desktop.
     let mut winsta = WinStaDesk::new().context("WinStaDesk::new")?;
 
-    // 6) Env block.
-    let mut env = build_env_block(spec.http_proxy, spec.socks_proxy);
+    // 6) Env block — verbatim passthrough of the broker's own
+    //    environment (the TS caller populates it with the full proxy
+    //    set; see `build_env_block`).
+    let mut env = build_env_block();
 
     // 7) Command line + application name.
     let cmdline = build_cmdline(spec.target_exe, spec.target_args);
@@ -328,63 +322,44 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
 
 // ─── Environment block ──────────────────────────────────────────────
 
-/// Build a `CREATE_UNICODE_ENVIRONMENT` block from the parent's env
-/// with proxy variables overridden. Uses a `BTreeMap` keyed on
-/// uppercase name so we overwrite (rather than duplicate) any
-/// inherited proxy vars regardless of case. The emitted block is
-/// sorted by that uppercase key — not the strict case-insensitive
-/// Unicode ordering the `CreateProcess` docs describe, but in
-/// practice the loader and `GetEnvironmentVariableW` don't enforce
-/// ordering; `cmd /c set` and every consumer we've tested work
-/// regardless.
+/// Build a `CREATE_UNICODE_ENVIRONMENT` block from the broker's own
+/// environment, **verbatim**.
 ///
-/// Both upper- and lower-case variants are emitted because some
-/// tools (curl, wget, libsoup) read only the lowercase form.
-fn build_env_block(
-    http_proxy: Option<u16>,
-    socks_proxy: Option<u16>,
-) -> Vec<u16> {
-    // Map: uppercase key → (original-case key, value).
-    let mut env: BTreeMap<String, (String, String)> = BTreeMap::new();
-    for (k, v) in std::env::vars() {
-        env.insert(k.to_ascii_uppercase(), (k, v));
-    }
-    // Strip any inherited proxy/no-proxy first.
-    for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
-        env.remove(k);
-    }
+/// `srt-win exec` is a dumb passthrough for proxy configuration: it
+/// does NOT synthesize `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` and has
+/// no `--http-proxy` / `--socks-proxy` flags. The single source of
+/// proxy env is the TS `generateProxyEnvVars`, which the caller merges
+/// into the environment it spawns `srt-win exec` with; this function
+/// just forwards that environment to the child. No proxy value is
+/// invented, no inherited var is stripped or blanked.
+///
+/// Entries are sorted case-insensitively by name for block ordering —
+/// not the strict case-insensitive Unicode collation the
+/// `CreateProcess` docs describe, but in practice the loader and
+/// `GetEnvironmentVariableW` don't enforce ordering; `cmd /c set` and
+/// every consumer we've tested work regardless. Names are NOT folded
+/// or deduplicated, so if both `HTTP_PROXY` and `http_proxy` are
+/// present both survive into the child.
+///
+/// The only adjustment on top of the verbatim copy is restoring the
+/// missing-case variants of `*_PROXY` variables (see
+/// [`add_proxy_case_twins`]) — casing repair of caller-provided
+/// values, not proxy synthesis. Nothing else is added: consumers that
+/// need the broker's identity (e.g. the self-protect probe) discover
+/// it by walking the parent-process chain rather than via an
+/// environment variable.
+fn build_env_block() -> Vec<u16> {
+    let mut entries: Vec<(String, String)> = std::env::vars().collect();
 
-    let mut set_both = |upper: &str, lower: &str, val: &str| {
-        env.insert(upper.into(), (upper.into(), val.into()));
-        // Lower-case form sorts after upper in ASCII so the
-        // uppercase-key dedup doesn't clobber it; insert under its
-        // own lower-case spelling as the map key so both survive.
-        env.insert(lower.into(), (lower.into(), val.into()));
-    };
-    if let Some(p) = http_proxy {
-        let url = format!("http://127.0.0.1:{p}");
-        set_both("HTTP_PROXY", "http_proxy", &url);
-        set_both("HTTPS_PROXY", "https_proxy", &url);
-    }
-    if let Some(p) = socks_proxy {
-        let url = format!("socks5h://127.0.0.1:{p}");
-        set_both("ALL_PROXY", "all_proxy", &url);
-    }
-    // Always blank NO_PROXY so an inherited bypass list doesn't
-    // route some hosts past the JS-side filter.
-    set_both("NO_PROXY", "no_proxy", "");
+    add_proxy_case_twins(&mut entries);
 
-    // Surface the broker PID so the test suite can verify
-    // self-protect (child tries `OpenProcess(<broker>)` → denied).
-    let pid = std::process::id().to_string();
-    env.insert(
-        "SANDBOX_RUNTIME_WIN_BROKER_PID".into(),
-        ("SANDBOX_RUNTIME_WIN_BROKER_PID".into(), pid),
-    );
+    // Order the block case-insensitively by name; values pass through
+    // verbatim. No dedup — case-variant duplicates are preserved.
+    entries.sort_by_cached_key(|(k, _)| k.to_ascii_uppercase());
 
     // Encode: `KEY=VALUE\0`… `\0`.
     let mut out: Vec<u16> = Vec::new();
-    for (_, (k, v)) in env {
+    for (k, v) in entries {
         out.extend(k.encode_utf16());
         out.push(b'=' as u16);
         out.extend(v.encode_utf16());
@@ -392,6 +367,32 @@ fn build_env_block(
     }
     out.push(0);
     out
+}
+
+/// Re-add the missing-case variants of `*_PROXY` variables (the host
+/// spawn layer collapses case-duplicate keys) so that Cygwin/MSYS2
+/// programs — which see a case-sensitive environment — still find
+/// them. For every entry whose name ends with `_PROXY`
+/// (case-insensitively), the all-uppercase and all-lowercase forms of
+/// that name are appended where missing, with the same value. Existing
+/// keys are never overwritten and nothing is added for names that are
+/// not `*_PROXY`.
+fn add_proxy_case_twins(entries: &mut Vec<(String, String)>) {
+    let mut names: std::collections::HashSet<String> =
+        entries.iter().map(|(k, _)| k.clone()).collect();
+    let mut twins: Vec<(String, String)> = Vec::new();
+    for (k, v) in entries.iter() {
+        if !k.to_ascii_uppercase().ends_with("_PROXY") {
+            continue;
+        }
+        for form in [k.to_ascii_uppercase(), k.to_ascii_lowercase()] {
+            if !names.contains(&form) {
+                names.insert(form.clone());
+                twins.push((form, v.clone()));
+            }
+        }
+    }
+    entries.extend(twins);
 }
 
 // ─── Command-line quoting ───────────────────────────────────────────
@@ -694,29 +695,38 @@ mod tests {
     }
 
     #[test]
-    fn env_block_sets_proxies() {
-        let block = build_env_block(Some(3128), Some(1080));
-        // Decode back to KEY=VALUE strings.
-        let s: String = String::from_utf16_lossy(&block);
-        let entries: Vec<&str> =
-            s.split('\0').filter(|e| !e.is_empty()).collect();
-        let has = |needle: &str| entries.contains(&needle);
-        assert!(has("HTTP_PROXY=http://127.0.0.1:3128"));
-        assert!(has("https_proxy=http://127.0.0.1:3128"));
-        assert!(has("ALL_PROXY=socks5h://127.0.0.1:1080"));
-        assert!(has("NO_PROXY="));
-        assert!(has("no_proxy="));
-        // Block must end with a double-NUL.
-        assert!(block.ends_with(&[0u16, 0u16]));
-    }
-
-    #[test]
-    fn env_block_no_proxy_when_unset() {
-        let block = build_env_block(None, None);
-        let s = String::from_utf16_lossy(&block);
-        assert!(!s.contains("HTTP_PROXY="));
-        assert!(!s.contains("ALL_PROXY="));
-        // NO_PROXY still blanked.
-        assert!(s.contains("NO_PROXY=\0"));
+    fn proxy_case_twins_suffix_rule_covers_any_proxy_var() {
+        let mut entries = vec![
+            // Any *_PROXY name is twinned, not just the standard trio.
+            (
+                "GRPC_PROXY".to_string(),
+                "socks5h://localhost:60081".to_string(),
+            ),
+            // Mixed-case input → BOTH canonical forms appended.
+            ("Http_Proxy".to_string(), "http://localhost:60080".to_string()),
+            // Names that merely contain or extend the suffix are not.
+            ("FOO_PROXYX".to_string(), "x".to_string()),
+            ("PATH".to_string(), r"C:\Windows".to_string()),
+        ];
+        add_proxy_case_twins(&mut entries);
+        let matching = |name: &str| {
+            entries
+                .iter()
+                .filter(|(k, _)| k == name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matching("grpc_proxy").len(), 1);
+        assert_eq!(matching("grpc_proxy")[0].1, "socks5h://localhost:60081");
+        assert_eq!(matching("GRPC_PROXY").len(), 1);
+        // Mixed-case original is preserved AND both canonical forms added.
+        assert_eq!(matching("Http_Proxy").len(), 1);
+        assert_eq!(matching("HTTP_PROXY").len(), 1);
+        assert_eq!(matching("http_proxy").len(), 1);
+        assert_eq!(matching("http_proxy")[0].1, "http://localhost:60080");
+        // Non-matching names untouched, nothing appended for them.
+        assert_eq!(matching("FOO_PROXYX").len(), 1);
+        assert!(matching("foo_proxyx").is_empty());
+        assert_eq!(matching("PATH").len(), 1);
+        assert!(matching("path").is_empty());
     }
 }

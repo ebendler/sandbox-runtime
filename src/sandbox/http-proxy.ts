@@ -74,7 +74,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
 
   // Handle CONNECT requests for HTTPS traffic
-  server.on('connect', async (req, socket, head) => {
+  server.on('connect', async (req, socket, headParam: Buffer) => {
+    let head: Buffer = headParam
     // Attach error handler immediately to prevent unhandled errors
     socket.on('error', err => {
       logForDebugging(`Client socket error: ${err.message}`, { level: 'error' })

@@ -207,51 +207,103 @@ try {
   $outRange.Stop()
 }
 
-# ── E5: --http-proxy / --socks-proxy reach the child's env ───────
-# `cmd /c set VAR` prints `VAR=value` if set, exits 1 if unset.
-# One Exec per var — no `&` chaining, so this row is independent
-# of the cmd-quoting behaviour exercised by E7.
-function Assert-Env {
+# ── E5: exec forwards the broker's env to the child verbatim ─────
+# Proxy config is single-sourced by the TS caller now: `srt-win exec`
+# has no --http-proxy/--socks-proxy flags and synthesizes nothing — it
+# forwards its OWN environment to the child. Prove that by setting the
+# proxy vars in THIS (broker) process and asserting the sandboxed child
+# sees the same values. `cmd /c set VAR` prints `VAR=value` if set,
+# exits 1 if unset. One Exec per var — no `&` chaining, so this row is
+# independent of the cmd-quoting behaviour exercised by E7.
+
+# Set $Var to $Value for the duration of $Body, then restore exactly
+# what was there before (including absence).
+function Invoke-WithEnv {
+  param([string]$Var, [string]$Value, [scriptblock]$Body)
+  $had = Test-Path "Env:$Var"
+  $old = if ($had) { (Get-Item "Env:$Var").Value } else { $null }
+  Set-Item -Path "Env:$Var" -Value $Value
+  try { & $Body }
+  finally {
+    if ($had) { Set-Item -Path "Env:$Var" -Value $old }
+    else { Remove-Item -Path "Env:$Var" -ErrorAction SilentlyContinue }
+  }
+}
+
+function Assert-EnvPassthrough {
   param([string]$Var, [string]$Want)
-  $r = Exec @('--http-proxy',"$PortLo",'--socks-proxy',"$($PortLo+1)",
-              '--', $cmd, '/c', "set $Var")
+  Invoke-WithEnv $Var $Want {
+    $r = Exec @('--', $cmd, '/c', "set $Var")
+    if ($r.exit -ne 0) {
+      throw "E5: 'set $Var' exited $($r.exit) (var unset in child?). out: $($r.out)"
+    }
+    $line = ($r.out -split "`r?`n" |
+             Where-Object { $_ -like "$Var=*" } |
+             Select-Object -First 1)
+    if ($line -ne "$Var=$Want") {
+      throw "E5: $Var expected '$Want', got '$line'. full: $($r.out)"
+    }
+  }
+}
+# Values are arbitrary — this proves verbatim passthrough; the real
+# values come from the TS generateProxyEnvVars. NO_PROXY doubles as the
+# regression guard for the old exec blanking it.
+Assert-EnvPassthrough 'HTTPS_PROXY' "http://127.0.0.1:$PortLo"
+Assert-EnvPassthrough 'NO_PROXY'    'localhost,127.0.0.1'
+Write-Host 'E5 ok: exec forwards broker env (incl. proxy set) to child verbatim'
+
+# ── E5b: broker restores the twin casing of *_PROXY vars ────────
+# The host spawn layer (Node/bun child_process on win32) keeps only ONE
+# casing of an env key, but Cygwin/MSYS2 children have case-sensitive
+# environments whose tools read the lowercase names — so exec appends
+# the missing twin (identical value, never invented). The broker process
+# itself can only hold one casing (Win32 env is case-insensitive), so
+# setting HTTP_PROXY here and finding BOTH casings in the child proves
+# the repair. `set http` lists matching vars with their STORED casing;
+# -clike is the case-SENSITIVE match.
+Invoke-WithEnv 'HTTP_PROXY' "http://127.0.0.1:$PortLo" {
+  $r = Exec @('--', $cmd, '/c', 'set http')
   if ($r.exit -ne 0) {
-    throw "E5: 'set $Var' exited $($r.exit) (var unset?). out: $($r.out)"
+    throw "E5b: 'set http' exited $($r.exit). out: $($r.out)"
   }
-  $line = ($r.out -split "`r?`n" |
-           Where-Object { $_ -like "$Var=*" } |
-           Select-Object -First 1)
-  if ($line -ne "$Var=$Want") {
-    throw "E5: $Var expected '$Want', got '$line'. full: $($r.out)"
+  $lines = $r.out -split "`r?`n"
+  if (-not ($lines | Where-Object { $_ -clike 'http_proxy=*' })) {
+    throw "E5b: lowercase http_proxy twin missing in child. out: $($r.out)"
+  }
+  if (-not ($lines | Where-Object { $_ -clike 'HTTP_PROXY=*' })) {
+    throw "E5b: uppercase HTTP_PROXY missing in child. out: $($r.out)"
   }
 }
-Assert-Env 'HTTP_PROXY'  "http://127.0.0.1:$PortLo"
-Assert-Env 'HTTPS_PROXY' "http://127.0.0.1:$PortLo"
-Assert-Env 'ALL_PROXY'   "socks5h://127.0.0.1:$($PortLo+1)"
-# NO_PROXY: build_env_block writes it as an empty string, which
-# cmd.exe treats as undefined (`set X=` deletes X;
-# GetEnvironmentVariableW returns ERROR_ENVVAR_NOT_FOUND for an
-# empty-string entry). Either outcome is "blanked" — what we
-# must NOT see is a non-empty value carried through from the
-# broker's environment.
-$r = Exec @('--http-proxy',"$PortLo",'--', $cmd, '/c',
-            'if defined NO_PROXY (echo NO_PROXY=[%NO_PROXY%]) else (echo NO_PROXY-undef)')
-$np = $r.out.Trim()
-if ($np -ne 'NO_PROXY-undef' -and $np -ne 'NO_PROXY=[]') {
-  throw "E5: NO_PROXY not blanked (got '$np')"
-}
-Write-Host 'E5 ok: proxy env vars injected'
+Write-Host 'E5b ok: broker restores the lowercase twin of proxy vars for the child'
 
 # ── E6: self-protect — child cannot OpenProcess the broker ──────
-# `launch::run` exports the broker PID. The child P/Invokes
-# OpenProcess directly with PROCESS_VM_READ — an unambiguous mask
-# that the broker-only DACL must deny. (`.NET Process.Handle`
+# The child discovers the broker by walking its parent-process chain
+# by NAME (the depth differs between cmd / powershell / git-bash
+# children, so no fixed hop count). Win32_Process.ParentProcessId is
+# readable without any handle on the broker itself, so discovery does
+# not depend on the access self-protect denies. The probe then
+# P/Invokes OpenProcess directly with PROCESS_VM_READ — an unambiguous
+# mask that the broker-only DACL must deny. (`.NET Process.Handle`
 # is NOT sufficient: it lazily falls back to
 # PROCESS_QUERY_LIMITED_INFORMATION, which can succeed via paths
 # the DACL doesn't fully gate; that produced a false "OPENED"
 # on the previous CI run.)
 $probe = @'
-$bp = [int]$env:SANDBOX_RUNTIME_WIN_BROKER_PID
+$bp = 0
+$why = ''
+$cur = $PID
+for ($i = 0; $i -lt 6; $i++) {
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+  if (-not $p) { $why = "WMI query failed at pid $cur (hop $i)"; break }
+  if ($p.Name -eq 'srt-win.exe') { $bp = [int]$p.ProcessId; break }
+  if (-not $p.ParentProcessId) { $why = "no parent beyond pid $cur (hop $i)"; break }
+  $cur = $p.ParentProcessId
+}
+if ($bp -eq 0) {
+  if (-not $why) { $why = 'hop cap reached without finding srt-win.exe' }
+  Write-Output "NOBROKER: $why"
+  exit 0
+}
 $sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenProcess(uint a,bool b,uint p);'
 $k32 = Add-Type -MemberDefinition $sig -Name K32 -Namespace W -PassThru
 # 0x0010 = PROCESS_VM_READ
@@ -280,6 +332,11 @@ $sddl = ($r.raw -split "`r?`n" |
          Where-Object { $_ -match 'self-protect applied' }) -join ' '
 Write-Host "E6 broker DACL: $sddl"
 Write-Host "E6 probe output: $($r.out.Trim())"
+if ($r.out -match 'NOBROKER') {
+  $reason = ($r.out -split "`r?`n" |
+             Where-Object { $_ -match '^NOBROKER' }) -join ' '
+  throw "E6: broker discovery failed — $reason. raw: $($r.raw)"
+}
 if ($r.out -match 'OPENED:vm_read') {
   throw "E6: child got PROCESS_VM_READ on broker " +
         "(self-protect ineffective). raw: $($r.raw)"
