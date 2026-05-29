@@ -146,6 +146,12 @@ async function main(): Promise<void> {
       'read config updates from file descriptor (JSON lines protocol)',
       parseInt,
     )
+    .option(
+      '--device <fqdn>',
+      'request a CDI device by fully-qualified name (repeatable, e.g. --device nvidia.com/gpu=0)',
+      (val: string, prev: string[]) => [...prev, val],
+      [] as string[],
+    )
     .allowUnknownOption()
     .action(
       async (
@@ -155,6 +161,7 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          device?: string[]
         },
       ) => {
         try {
@@ -174,6 +181,26 @@ async function main(): Promise<void> {
               `No config found at ${configPath}, using default config`,
             )
             runtimeConfig = getDefaultConfig()
+          }
+
+          // Merge --device CLI flag(s) into runtimeConfig.cdi.requestedDevices.
+          // CLI-provided devices extend (not replace) any list from the config
+          // file, so admins can pin a base set in the settings and operators
+          // can add to it at invocation time.
+          if (options.device && options.device.length > 0) {
+            runtimeConfig = {
+              ...runtimeConfig,
+              cdi: {
+                ...runtimeConfig.cdi,
+                requestedDevices: [
+                  ...(runtimeConfig.cdi?.requestedDevices ?? []),
+                  ...options.device,
+                ],
+              },
+            }
+            logForDebugging(
+              `CDI devices requested via --device: ${options.device.join(', ')}`,
+            )
           }
 
           // Initialize sandbox with config

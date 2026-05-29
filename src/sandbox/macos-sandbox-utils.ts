@@ -19,7 +19,6 @@ import type {
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
-
 export interface MacOSSandboxParams {
   command: string
   needsNetworkRestriction: boolean

@@ -5,7 +5,8 @@ import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-uti
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
@@ -820,6 +821,163 @@ describe('allowWrite glob suffix handling', () => {
       } finally {
         await SandboxManager.reset()
         rmSync(parentDir, { recursive: true, force: true })
+      }
+    },
+  )
+})
+
+const cdiFixturesDir = resolve(
+  fileURLToPath(import.meta.url),
+  '..',
+  'fixtures/cdi',
+)
+
+describe('CDI device passthrough', () => {
+  it.if(isLinux)(
+    'Linux: injects --setenv, --dev-bind, and --ro-bind for a resolved device',
+    async () => {
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: ['/tmp'],
+          denyWrite: [],
+        },
+        cdi: {
+          specDirs: [cdiFixturesDir],
+          requestedDevices: ['nvidia.com/gpu=0'],
+        },
+        allowAllUnixSockets: true,
+      })
+      try {
+        const wrapped = await SandboxManager.wrapWithSandbox('echo hello')
+        // Spec-level env
+        expect(wrapped).toContain('--setenv NVIDIA_VISIBLE_DEVICES void')
+        // Device-level env (later — concat preserves order)
+        expect(wrapped).toContain('--setenv NVIDIA_VISIBLE_DEVICES 0')
+        // Device nodes
+        expect(wrapped).toContain('--dev-bind /dev/nvidia0 /dev/nvidia0')
+        expect(wrapped).toContain('--dev-bind /dev/nvidiactl /dev/nvidiactl')
+        // Spec-level mount (ro)
+        expect(wrapped).toContain(
+          '--ro-bind /usr/bin/nvidia-smi /usr/bin/nvidia-smi',
+        )
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+  )
+
+  it.if(isLinux)(
+    'Linux: merges spec-level edits once across multiple devices from the same spec',
+    async () => {
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        cdi: {
+          specDirs: [cdiFixturesDir],
+          requestedDevices: ['nvidia.com/gpu=0', 'nvidia.com/gpu=1'],
+        },
+        allowAllUnixSockets: true,
+      })
+      try {
+        const wrapped = await SandboxManager.wrapWithSandbox('echo hello')
+        // Spec-level env appears exactly once
+        const matches = wrapped.match(/--setenv NVIDIA_VISIBLE_DEVICES void/g)
+        expect(matches?.length).toBe(1)
+        // Both devices' env vars present
+        expect(wrapped).toContain('--setenv NVIDIA_VISIBLE_DEVICES 0')
+        expect(wrapped).toContain('--setenv NVIDIA_VISIBLE_DEVICES 1')
+        // Both devices' nodes
+        expect(wrapped).toContain('--dev-bind /dev/nvidia0 /dev/nvidia0')
+        expect(wrapped).toContain('--dev-bind /dev/nvidia1 /dev/nvidia1')
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+  )
+
+  it.if(isLinux)(
+    'Linux: throws when a requested device is denied by policy',
+    async () => {
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        cdi: {
+          specDirs: [cdiFixturesDir],
+          requestedDevices: ['nvidia.com/gpu=0'],
+          denyDevices: ['nvidia.com/gpu=*'],
+        },
+        allowAllUnixSockets: true,
+      })
+      try {
+        let threw = false
+        try {
+          await SandboxManager.wrapWithSandbox('echo hello')
+        } catch (e) {
+          threw = true
+          expect((e as Error).message).toMatch(/denylist/i)
+        }
+        expect(threw).toBe(true)
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+  )
+
+  it.if(isLinux)(
+    'Linux: throws when a requested device is not in any spec',
+    async () => {
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        cdi: {
+          specDirs: [cdiFixturesDir],
+          requestedDevices: ['nvidia.com/gpu=999'],
+        },
+        allowAllUnixSockets: true,
+      })
+      try {
+        let threw = false
+        try {
+          await SandboxManager.wrapWithSandbox('echo hello')
+        } catch (e) {
+          threw = true
+          expect((e as Error).message).toMatch(/not found/i)
+        }
+        expect(threw).toBe(true)
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+  )
+
+  it.if(!isLinux)(
+    'emits a warning and does not include CDI args in the wrapped command on non-Linux',
+    async () => {
+      const warns: string[] = []
+      const originalWarn = console.warn
+      console.warn = (...args: unknown[]) => {
+        warns.push(args.map(String).join(' '))
+      }
+      try {
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+          cdi: {
+            // Default specDirs (omitted) — these don't exist on macOS, mimicking
+            // a real Mac dev machine. The warn-skip path must run before we
+            // try to resolve.
+            requestedDevices: ['nvidia.com/gpu=0'],
+          },
+        })
+        const wrapped = await SandboxManager.wrapWithSandbox('echo hello')
+        expect(warns.some(w => /not supported/i.test(w))).toBe(true)
+        expect(wrapped).not.toContain('--dev-bind')
+        expect(wrapped).not.toContain('/dev/nvidia0')
+      } finally {
+        console.warn = originalWarn
+        await SandboxManager.reset()
       }
     },
   )

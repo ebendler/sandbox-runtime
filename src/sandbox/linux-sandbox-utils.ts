@@ -20,6 +20,8 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
+import type { ContainerEdits as CdiContainerEdits } from '@cncf-tags/container-device-interface'
+import { cdiEditsToBwrapArgs } from './cdi-translate.js'
 import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
 import type { SeccompConfig } from './sandbox-config.js'
 
@@ -59,6 +61,8 @@ export interface LinuxSandboxParams {
   socatPath?: string
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
+  /** Merged CDI ContainerEdits from any requested devices. */
+  cdiEdits?: CdiContainerEdits
 }
 
 /** Default max depth for searching dangerous files */
@@ -1086,6 +1090,7 @@ export async function wrapCommandWithSandboxLinux(
     bwrapPath,
     socatPath,
     abortSignal,
+    cdiEdits,
   } = params
 
   // Determine if we have restrictions to apply
@@ -1248,6 +1253,13 @@ export async function wrapCommandWithSandboxLinux(
     // capability-bearing unprivileged user namespaces (the same requirement
     // bwrap itself has when not installed setuid). See README for the
     // Ubuntu 24.04 sysctl if AppArmor restricts this.
+
+    // ========== CDI DEVICE PASSTHROUGH ==========
+    // Append CDI-derived --setenv / --dev-bind / --ro-bind / --bind args.
+    // These come last so they aren't masked by earlier --bind / / rules.
+    if (cdiEdits) {
+      bwrapArgs.push(...cdiEditsToBwrapArgs(cdiEdits))
+    }
 
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work

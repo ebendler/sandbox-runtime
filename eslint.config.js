@@ -77,18 +77,19 @@ export default [
       'eslint-plugin-n/no-unsupported-features/es-builtins': [
         'error',
         {
-          version: '>=18.0.0',
+          version: '>=22.0.0',
           ignores: [],
         },
       ],
       'eslint-plugin-n/no-unsupported-features/node-builtins': [
         'error',
         {
-          version: '>=18.0.0',
+          version: '>=22.0.0',
           // Web-standard Request/Headers/ReadableStream and the
-          // Readable.toWeb/fromWeb adapters are available since Node 18.0.0
-          // (the rule flags them as experimental until 21–23) and stable in
-          // Bun, which is SRT's primary runtime.
+          // Readable.toWeb/fromWeb adapters are still flagged as experimental
+          // by eslint-plugin-n until specific 22.x point releases. They're
+          // stable in Bun (SRT's primary runtime) and present in all Node 22
+          // versions we ship to.
           ignores: [
             'Request',
             'Headers',

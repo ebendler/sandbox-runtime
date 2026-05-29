@@ -7,6 +7,7 @@ import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
+import { isQualifiedName } from '@cncf-tags/container-device-interface'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -341,6 +342,57 @@ export const SeccompConfigSchema = z.object({
 })
 
 /**
+ * Schema for a CDI device pattern. Accepts either:
+ *   - an exact FQDN per the CDI spec (e.g. "nvidia.com/gpu=0"), validated by
+ *     the upstream `isQualifiedName` helper, or
+ *   - a trailing-wildcard pattern (`kind=*`) where the kind portion is a valid
+ *     CDI kind (e.g. "nvidia.com/gpu=*").
+ */
+const cdiPatternSchema = z.string().refine(
+  val => {
+    if (val.endsWith('=*')) {
+      const kind = val.slice(0, -2)
+      return isQualifiedName(`${kind}=dummy`)
+    }
+    return isQualifiedName(val)
+  },
+  {
+    message:
+      'Invalid CDI pattern. Must be an exact FQDN (e.g. "vendor.com/kind=0") or a trailing-wildcard form ("vendor.com/kind=*").',
+  },
+)
+
+const cdiRequestedDeviceSchema = z
+  .string()
+  .refine(val => isQualifiedName(val), {
+    message:
+      'Invalid CDI requested device. Must be a fully qualified name like "vendor.com/kind=0".',
+  })
+
+export const CdiConfigSchema = z.object({
+  specDirs: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'Directories to scan for CDI specs. Defaults to ["/etc/cdi", "/var/run/cdi"] when omitted.',
+    ),
+  requestedDevices: z
+    .array(cdiRequestedDeviceSchema)
+    .optional()
+    .describe('Fully qualified CDI device names to inject into the sandbox.'),
+  allowDevices: z
+    .array(cdiPatternSchema)
+    .optional()
+    .describe(
+      'Admin allowlist of patterns. Omitted = allow all requested. Empty = allow none.',
+    ),
+  denyDevices: z
+    .array(cdiPatternSchema)
+    .optional()
+    .describe('Admin denylist of patterns. Denial takes precedence.'),
+})
+
+/**
  * Main configuration schema for Sandbox Runtime validation
  */
 export const SandboxRuntimeConfigSchema = z.object({
@@ -399,9 +451,13 @@ export const SandboxRuntimeConfigSchema = z.object({
   windows: WindowsConfigSchema.optional().describe(
     'Windows-specific settings (group, WFP sublayer, proxy port range).',
   ),
+  cdi: CdiConfigSchema.optional().describe(
+    'Optional CDI device passthrough configuration (Linux only).',
+  ),
 })
 
 // Export inferred types
+export type CdiConfig = z.infer<typeof CdiConfigSchema>
 export type MitmProxyConfig = z.infer<typeof MitmProxyConfigSchema>
 export type ParentProxyConfig = z.infer<typeof ParentProxyConfigSchema>
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>

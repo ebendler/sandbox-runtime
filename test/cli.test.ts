@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
+import { isLinux } from './helpers/platform.js'
 
 /**
  * Get the path to the CLI entry point
@@ -162,5 +163,76 @@ describe('CLI', () => {
       expect(result.stderr).toContain('[SandboxDebug]')
       expect(result.status).toBe(0)
     })
+  })
+
+  describe('--device flag', () => {
+    test('--help mentions the --device option', () => {
+      const result = runCli(['--help'])
+      expect(result.stdout).toMatch(/--device <fqdn>/i)
+      expect(result.status).toBe(0)
+    })
+
+    test('debug output confirms --device value(s) are picked up', () => {
+      // Use a deliberately-unresolvable FQDN so the CLI fails fast on Linux
+      // (registry empty, "not found") or warn-skips on macOS — either way we
+      // can confirm the flag was parsed and threaded by checking the debug
+      // line. Without --device, no such line would appear.
+      const result = runCli(
+        ['--device', 'unresolved.example/none=0', '-c', 'true'],
+        { debug: true },
+      )
+      expect(result.stderr).toContain('--device: unresolved.example/none=0')
+    })
+
+    test('repeated --device flags accumulate', () => {
+      const result = runCli(
+        [
+          '--device',
+          'unresolved.example/none=0',
+          '--device',
+          'unresolved.example/none=1',
+          '-c',
+          'true',
+        ],
+        { debug: true },
+      )
+      // Both FQDNs appear in the debug "requested via --device" line.
+      expect(result.stderr).toMatch(
+        /--device: unresolved\.example\/none=0, unresolved\.example\/none=1/,
+      )
+    })
+
+    test.if(isLinux)(
+      'Linux: unresolvable --device causes a CDI error and non-zero exit',
+      () => {
+        const result = runCli([
+          '--device',
+          'unresolved.example/none=0',
+          '-c',
+          'true',
+        ])
+        // On Linux the registry is empty (no /etc/cdi spec for this kind), so
+        // wrapWithSandbox throws "CDI device(s) not found".
+        expect(result.stderr).toMatch(/CDI/i)
+        expect(result.status).not.toBe(0)
+      },
+    )
+
+    test.if(!isLinux)(
+      'non-Linux: --device warns and command still succeeds',
+      () => {
+        const result = runCli([
+          '--device',
+          'unresolved.example/none=0',
+          '-c',
+          'echo hi',
+        ])
+        // macOS/Windows path: warn-skip emits "not supported on $PLATFORM"
+        // and the command runs without CDI.
+        expect(result.stderr).toMatch(/not supported/i)
+        expect(result.stdout.trim()).toBe('hi')
+        expect(result.status).toBe(0)
+      },
+    )
   })
 })

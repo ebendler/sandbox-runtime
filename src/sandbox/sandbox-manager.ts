@@ -7,6 +7,12 @@ import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
 import type { SandboxRuntimeConfig, SeccompConfig } from './sandbox-config.js'
+import {
+  discover as cdiDiscover,
+  type Registry as CdiRegistry,
+  type ContainerEdits as CdiContainerEdits,
+} from '@cncf-tags/container-device-interface'
+import { evaluatePolicy, DEFAULT_CDI_SPEC_DIRS } from './cdi-policy.js'
 import type {
   SandboxAskCallback,
   FsReadRestrictionConfig,
@@ -70,6 +76,7 @@ let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
+let cdiRegistry: CdiRegistry | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 
 // ============================================================================
@@ -345,6 +352,36 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+
+  // CDI: build the Registry if cdi config is present
+  if (config.cdi !== undefined) {
+    const dirs = config.cdi.specDirs ?? [...DEFAULT_CDI_SPEC_DIRS]
+    try {
+      cdiRegistry = await cdiDiscover({
+        directories: dirs,
+        onError: 'collect',
+      })
+      const errs = cdiRegistry.errors()
+      if (errs.length > 0) {
+        logForDebugging(
+          `[CDI] Discovered ${cdiRegistry.specs().length} spec(s) with ${errs.length} non-fatal error(s)`,
+        )
+        for (const e of errs) {
+          logForDebugging(`[CDI] ${e.file}: ${e.message}`)
+        }
+      } else {
+        logForDebugging(
+          `[CDI] Discovered ${cdiRegistry.specs().length} spec(s) from ${dirs.join(', ')}`,
+        )
+      }
+    } catch (e) {
+      logForDebugging(
+        `[CDI] Discovery failed: ${(e as Error).message}; continuing without CDI`,
+        { level: 'error' },
+      )
+      cdiRegistry = undefined
+    }
+  }
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
@@ -703,6 +740,32 @@ async function waitForNetworkInitialization(): Promise<boolean> {
   return managerContext !== undefined
 }
 
+function resolveCdiEdits(): CdiContainerEdits | undefined {
+  if (!config?.cdi?.requestedDevices?.length) return undefined
+  if (!cdiRegistry) {
+    throw new Error(
+      'CDI devices were requested but the registry is unavailable (initialize() may have failed)',
+    )
+  }
+  const policy = {
+    allow: config.cdi.allowDevices,
+    deny: config.cdi.denyDevices ?? [],
+  }
+  for (const fqdn of config.cdi.requestedDevices) {
+    const decision = evaluatePolicy(fqdn, policy)
+    if (decision.decision === 'deny') {
+      throw new Error(`CDI policy rejected ${fqdn}: ${decision.reason}`)
+    }
+  }
+  const result = cdiRegistry.resolveMany(config.cdi.requestedDevices)
+  if (result.notFound.length > 0) {
+    throw new Error(
+      `CDI device(s) not found in any spec: ${result.notFound.join(', ')}`,
+    )
+  }
+  return result.edits
+}
+
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
@@ -799,6 +862,15 @@ async function wrapWithSandbox(
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
+  let cdiEdits: CdiContainerEdits | undefined
+  if (platform === 'linux') {
+    cdiEdits = resolveCdiEdits()
+  } else if (config?.cdi?.requestedDevices?.length) {
+    console.warn(
+      `[Sandbox ${platform}] CDI device passthrough is not supported on ${platform}; skipping ${config.cdi.requestedDevices.length} requested device(s).`,
+    )
+  }
+
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
@@ -852,6 +924,7 @@ async function wrapWithSandbox(
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
         abortSignal,
+        cdiEdits,
       })
 
     case 'windows':
@@ -1168,6 +1241,7 @@ async function reset(): Promise<void> {
   initializationPromise = undefined
   parentProxy = undefined
   mitmCA = undefined
+  cdiRegistry = undefined
 }
 
 function getSandboxViolationStore() {
